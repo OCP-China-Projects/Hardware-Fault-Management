@@ -78,3 +78,48 @@ OpenBMC MTD image will be generated at
 ```shell
 $OPENBMC_CODE_BASE/build/evb-ast2600/tmp/deploy/images/evb-ast2600/obmc-phosphor-image-evb-ast2600-$BUILD_TIME.static.mtd
 ```
+
+## Hardware Fault Management QEMU instance
+
+Hardware Fault Management instance is based on zephyr porject, please use
+following command to launch Hardware Fault Management QEMU instance
+
+### Use prebuilt binaries
+
+```shell
+cd scripts
+./launch_hfm.sh
+```
+
+### Build zephyr image from scratch
+```shell
+export ZEPHYR_DIR=zephyr_project
+
+# Install west tool if not available
+if ! command -v west >/dev/null 2>&1; then
+	echo "Installing west tool..."
+    pip3 install west --break-system-packages
+fi
+
+python3 -m venv $ZEPHYR_DIR/.venv
+source $ZEPHYR_DIR/.venv/bin/activate
+
+west init $ZEPHYR_DIR
+cd $ZEPHYR_DIR
+west update
+
+west zephyr-export
+
+cd zephyr
+west sdk install
+
+west build -b hifive_unmatched/fu740/u74 -p always samples/hello_world/ -- -DDTC_OVERLAY_FILE=app.overlay
+west build -t run
+
+deactivate
+```
+
+OpenBMC MTD image will be generated at
+```shell
+ $ZEPHYR_DIR/zephyr/build/zephyr/zephyr.elf
+```
