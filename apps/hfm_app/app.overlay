@@ -1,0 +1,22 @@
+/*
+ * HFM devicetree overlay.
+ *
+ * Reserves a place for I3C-related nodes. On sifive_u the SoC has no
+ * I3C controller in-tree, so this overlay only wires up the console
+ * for now. Add I3C nodes here when a controller becomes available:
+ *
+ *   &i3c0 {
+ *       status = "okay";
+ *       hfm_target: hfm_target@70 {
+ *           compatible = "hfm,target";
+ *           reg = <0x70 0 0>;
+ *       };
+ *   };
+ */
+
+/ {
+    chosen {
+        zephyr,console = &uart0;
+        zephyr,shell-uart = &uart0;
+    };
+};

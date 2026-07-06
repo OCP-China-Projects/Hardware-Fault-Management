@@ -1,0 +1,45 @@
+From: Terry Gong <terry.gong@bytedance.com>
+Subject: [PATCH] bitbake: tolerate read-only /proc when disabling network
+
+Some sandboxed build environments (containers, restricted mount
+namespaces) present /proc as a read-only mount even for root. In that
+case bb.utils.disable_network() succeeds in unshare(CLONE_NEWUSER|
+CLONE_NEWNET) but then aborts with:
+
+    OSError: [Errno 30] Read-only file system: '/proc/self/uid_map'
+
+which fails every do_unpack. There is nothing bitbake can do about the
+sandbox, but the failure mode is unnecessary: the network is already
+unshared inside the new namespace, so if we cannot write the uid/gid
+maps we simply lose the ability to keep the original uid, which is not
+required for do_unpack.
+
+Catch OSError from those writes and downgrade to a debug log message,
+matching the existing behavior for the "unshare not supported" path.
+
+Apply on top of poky/master (bitbake 2.12).
+
+diff --git a/poky/bitbake/lib/bb/utils.py b/poky/bitbake/lib/bb/utils.py
+--- a/poky/bitbake/lib/bb/utils.py
++++ b/poky/bitbake/lib/bb/utils.py
+@@ -1714,12 +1714,16 @@ def disable_network(uid=None, gid=None):
+     ret = libc.unshare(CLONE_NEWNET | CLONE_NEWUSER)
+     if ret != 0:
+         logger.debug("System doesn't support disabling network without admin privs")
+         return
+-    with open("/proc/self/uid_map", "w") as f:
+-        f.write("%s %s 1" % (uid, uid))
+-    with open("/proc/self/setgroups", "w") as f:
+-        f.write("deny")
+-    with open("/proc/self/gid_map", "w") as f:
+-        f.write("%s %s 1" % (gid, gid))
++    try:
++        with open("/proc/self/uid_map", "w") as f:
++            f.write("%s %s 1" % (uid, uid))
++        with open("/proc/self/setgroups", "w") as f:
++            f.write("deny")
++        with open("/proc/self/gid_map", "w") as f:
++            f.write("%s %s 1" % (gid, gid))
++    except OSError as e:
++        logger.debug("Skipping network disable: cannot write /proc uid/gid maps (%s)" % e)
++        return

@@ -1,0 +1,15 @@
+# Zephyr / west build artifacts
+build/
+.west/
+zephyr_project/
+
+# Prebuilt binaries decompressed at runtime by launch_*.sh
+prebuilts/*.elf
+!prebuilts/*.elf.gz
+prebuilts/*.mtd
+!prebuilts/*.mtd.gz
+
+# Editors / OS
+*.swp
+*~
+.DS_Store

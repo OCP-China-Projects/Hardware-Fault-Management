@@ -3,7 +3,9 @@
 CUR_DIR=$(pwd)
 WORK_DIR=$(dirname $(pwd))
 PREBUILTS_DIR=${WORK_DIR}/prebuilts
-QEMU_ARM_BIN=qemu-system-arm
+QEMU_ARM_BIN=${QEMU_ARM_BIN:-$HOME/qemu-build/bin/qemu-system-arm}
+export LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu:$HOME/local/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+[ -x "${QEMU_ARM_BIN}" ] || QEMU_ARM_BIN=qemu-system-arm
 OPENBMC_IMG=obmc-phosphor-image-evb-ast2600.mtd
 SSH_PORT=3222
 HTTP_PORT=1443

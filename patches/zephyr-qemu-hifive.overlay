@@ -1,0 +1,21 @@
+/*
+ * Overlay for building hifive_unmatched Zephyr images that boot on
+ * QEMU's sifive_u machine.
+ *
+ * The default hifive_unmatched device tree pins zephyr,sram to l2lim
+ * (address 0x08000000). QEMU's sifive_u model does not implement the
+ * L2 LIM SRAM, only DDR at 0x80000000, so images linked at 0x08000000
+ * never fetch. Redirect zephyr,sram to ram0 (DDR) so the image is
+ * linked at 0x80000000, which QEMU can execute.
+ *
+ * Usage:
+ *   west build -b hifive_unmatched/fu740/u74 -p always \
+ *              samples/hello_world \
+ *              -- -DDTC_OVERLAY_FILE=<path>/zephyr-qemu-hifive.overlay
+ */
+
+/ {
+	chosen {
+		zephyr,sram = &ram0;
+	};
+};
