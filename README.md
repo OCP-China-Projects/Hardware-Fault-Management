@@ -82,8 +82,16 @@ sudo sysctl -w kernel.unprivileged_userns_clone=1
 
 cd openbmc
 git checkout 2.18.0 -b 2.18.0
-export TEMPLATECONF="meta-evb/meta-evb-aspeed/meta-evb-ast2600/conf"
-. setup evb-ast2600
+
+# bitbake 2.12 requires Python 3.9+. Ubuntu 20.04 ships 3.8 as
+# `python3`, so add a shim that points `python3` at 3.9 for this shell:
+sudo apt install -y python3.9
+mkdir -p /tmp/bb-pyshim
+ln -sf /usr/bin/python3.9 /tmp/bb-pyshim/python3
+export PATH=/tmp/bb-pyshim:$PATH
+
+export TEMPLATECONF="meta-evb/meta-evb-aspeed/meta-evb-ast2600/conf/templates/default"
+source ./poky/oe-init-build-env build
 bitbake obmc-phosphor-image
 ```
 
