@@ -145,8 +145,15 @@ west sdk install
 
 # NOTE: hifive_unmatched's default DTS pins zephyr,sram to L2 LIM
 # (0x08000000), which QEMU's sifive_u machine does not implement.
-# Overriding zephyr,sram to ram0 (DDR at 0x80000000) is required for the
-# image to boot under QEMU. See patches/zephyr-qemu-hifive.overlay.
+# The overlay redirects zephyr,sram to ram0 (DDR at 0x80000000) and
+# shrinks ram0 to match `qemu -m 256`, otherwise the heap init trips
+# a Store/AMO access fault at the top of the 16 GiB DDR region.
+#
+# QEMU's sifive_u_prci model also does not implement the PLL_LOCK
+# bit, so soc_early_init_hook busy-loops forever waiting for it.
+# Apply the timeout patch to keep the boot moving:
+patch -p1 -d zephyr < ../../patches/zephyr-fu700-pll-lock-qemu-timeout.patch
+
 west build -b hifive_unmatched/fu740/u74 -p always samples/hello_world/ \
     -- -DDTC_OVERLAY_FILE=$(pwd)/../../patches/zephyr-qemu-hifive.overlay
 
@@ -159,6 +166,13 @@ qemu-system-riscv64 \
     -serial mon:stdio
 
 deactivate
+```
+
+Expected output:
+
+```
+*** Booting Zephyr OS build v4.3.0 ***
+Hello World! hifive_unmatched/fu740/u74
 ```
 
 The Zephyr ELF will be generated at

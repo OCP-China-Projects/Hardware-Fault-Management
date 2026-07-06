@@ -3,19 +3,23 @@
  * QEMU's sifive_u machine.
  *
  * The default hifive_unmatched device tree pins zephyr,sram to l2lim
- * (address 0x08000000). QEMU's sifive_u model does not implement the
- * L2 LIM SRAM, only DDR at 0x80000000, so images linked at 0x08000000
- * never fetch. Redirect zephyr,sram to ram0 (DDR) so the image is
- * linked at 0x80000000, which QEMU can execute.
+ * (0x08000000). QEMU's sifive_u model does not implement the L2 LIM,
+ * only DDR at 0x80000000, so images linked at 0x08000000 never fetch.
+ * Redirect zephyr,sram to ram0 so the image is linked at 0x80000000.
  *
- * Usage:
- *   west build -b hifive_unmatched/fu740/u74 -p always \
- *              samples/hello_world \
- *              -- -DDTC_OVERLAY_FILE=<path>/zephyr-qemu-hifive.overlay
+ * Additionally shrink ram0 to 256 MiB. The stock devicetree declares
+ * 16 GiB (matching the real board), but QEMU is launched with `-m 256`.
+ * Zephyr places its heap and stacks near the top of ram0, so leaving
+ * the full 16 GiB size trips a Store/AMO access fault the moment the
+ * heap is initialised.
  */
 
 / {
 	chosen {
 		zephyr,sram = &ram0;
 	};
+};
+
+&ram0 {
+	reg = <0x0 0x80000000 0x0 0x10000000>;   /* 256 MiB */
 };
