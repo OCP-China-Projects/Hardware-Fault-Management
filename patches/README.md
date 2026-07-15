@@ -1,6 +1,6 @@
 # Local MR set — MCTP bindings + PLDM (Type 0 & Type 2) for Zephyr, and MCTP/PLDM for OpenBMC
 
-The OCP HFM prototype is delivered as eight numbered patches split across two
+The OCP HFM prototype is delivered as nine numbered patches split across two
 trees. Zephyr patches stack on tag `v4.3.0`; OpenBMC patches are Yocto-layer
 diffs rooted at the OpenBMC tree top.
 
@@ -14,6 +14,7 @@ diffs rooted at the OpenBMC tree top.
 - 0005 MCTP-over-serial binding (DSP0253)
 - 0007 PLDM Type 2 platform responder + PDR (DSP0248) — MR1
 - 0008 MCTP control responder (DSP0236) + serial_bridge Type 2 wiring — MR2
+- 0009 set MCTP tag-owner bit on requester TX — reverse-path fix (MR3)
 
 **OpenBMC side** (Yocto layers):
 
@@ -30,6 +31,7 @@ diffs rooted at the OpenBMC tree top.
 | 6 | `0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch`   | OpenBMC (Yocto layers) |
 | 7 | `0007-subsys-pmci-pldm-add-DSP0248-Type-2-Platform-Monitor.patch`  | Zephyr `hfm/pldm-type2` |
 | 8 | `0008-subsys-pmci-mctp-add-DSP0236-control-responder-wire-.patch`  | Zephyr `hfm/pldm-type2` |
+| 9 | `0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch`   | Zephyr `hfm/pldm-type2` |
 
 Auxiliary (non-numbered) patches, applied per README Part 1/3 rather than
 as part of the MR stack:
@@ -475,6 +477,39 @@ image full auto-discovery is blocked by the kernel bug documented under patch
 
 ---
 
+## Patch 0009 — set the MCTP tag-owner bit on requester TX (reverse-path fix, MR3)
+
+Fixes the reverse-direction PLDM path (Zephyr requester EID 18 → OpenBMC
+responder EID 8). `pldm_send_request_sync()` transmitted requests with
+`MCTP_MESSAGE_TO_DST` (tag-owner bit TO = 0). A PLDM requester owns the message
+tag (DSP0236 §8.1), so requests must be sent with TO = 1.
+
+- The BMC runs the Linux kernel AF_MCTP stack (not libmctp). Its input path
+  (`net/mctp/route.c` `mctp_route_input`) only hands an inbound SOM frame to a
+  bound listening socket when the frame has TO = 1 and no existing key matches
+  (`if (!key && !msk && (tag & MCTP_HDR_FLAG_TO)) msk = mctp_lookup_bind(...)`).
+  A TO = 0 frame is treated as an orphan response and dropped with `-ENOENT`
+  before reaching the PLDM responder socket. The mctp-serial line discipline
+  still counts it in `rx_packets` — exactly the symptom seen: `rx_packets` grew
+  but the responder received nothing and `tx_packets` stayed 0.
+- The forward path always worked because Zephyr's responder replies with
+  `MCTP_MESSAGE_TO_SRC` (TO = 1), and the libmctp↔libmctp Type 0 loopback sample
+  never exercises the kernel's TO gate, so the bug was invisible in unit tests.
+
+### Files
+
+| File | Change |
+|---|---|
+| `subsys/pmci/pldm/pldm.c` | `pldm_send_request_sync()`: `MCTP_MESSAGE_TO_DST` → `MCTP_MESSAGE_TO_SRC` |
+
+Validated end to end on the two-QEMU bridge: Zephyr prints `BMC GetTID -> 0x08`,
+`BMC GetPLDMTypes -> byte0=0x01`, `BMC GetPLDMVersion(BASE) -> 0.0.1`,
+`Reverse-direction PLDM probe to BMC complete`; the BMC base responder receives
+the inbound requests (`tag 0x08` == TO set) and answers each, and `mctpserial0`
+shows matching `rx_packets=3 / tx_packets=3` (design doc §10c).
+
+---
+
 ## How to apply (Zephyr patches)
 
 ```sh
@@ -486,6 +521,7 @@ git am /path/to/Hardware-Fault-Management/patches/0003-subsys-pmci-mctp-add-MCTP
 git am /path/to/Hardware-Fault-Management/patches/0005-subsys-pmci-mctp-add-MCTP-over-serial-binding-DSP025.patch
 git am /path/to/Hardware-Fault-Management/patches/0007-subsys-pmci-pldm-add-DSP0248-Type-2-Platform-Monitor.patch
 git am /path/to/Hardware-Fault-Management/patches/0008-subsys-pmci-mctp-add-DSP0236-control-responder-wire-.patch
+git am /path/to/Hardware-Fault-Management/patches/0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch
 # (west.yml already updated by 0002; run `west update` to fetch libpldm)
 west update libpldm
 ```
