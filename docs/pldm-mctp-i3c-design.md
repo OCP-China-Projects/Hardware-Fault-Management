@@ -501,6 +501,71 @@ forward-to-PLDM path and the MR1 Type 2 sensor responder over the genuine kernel
 transport. **Conclusion: MR1+MR2 are functionally correct; full `mctpd`
 auto-discovery on this environment awaits a kernel with a working AF_MCTP dump.**
 
+#### Reverse-direction probe: root cause + fix (MR3, patch 0009)
+
+The forward path (BMC requester → Zephyr responder) validated above worked from
+the start. The **reverse** path (Zephyr requester EID 18 → BMC responder EID 8)
+did not: the Zephyr node's `serial_bridge` probe thread issued GetTID / GetPLDMTypes
+/ GetPLDMVersion to the BMC and every call returned `-ETIMEDOUT`. The BMC's
+`mctpserial0` `rx_packets` counter incremented on each attempt, yet no PLDM
+responder socket ever received a datagram and `tx_packets` stayed 0 — the frame
+was received by the serial line discipline but dropped inside the kernel before
+delivery.
+
+**Root cause — requester transmitted with the tag-owner bit clear.**
+`pldm_send_request_sync()` sent requests with `MCTP_MESSAGE_TO_DST`, which
+libmctp maps to tag-owner (TO) bit = 0 on the wire. But a PLDM requester *owns*
+the message tag (DSP0236 §8.1), so the request must carry TO = 1. The BMC runs
+the Linux kernel AF_MCTP stack, not libmctp, and its input path only delivers an
+inbound SOM frame to a bound listening socket when TO = 1 and no existing key
+matches:
+
+```c
+/* net/mctp/route.c, mctp_route_input() */
+if (!key && !msk && (tag & MCTP_HDR_FLAG_TO))
+        msk = mctp_lookup_bind(net, skb);
+if (!msk) { rc = -ENOENT; goto out_unlock; }   /* TO=0 request dropped here */
+```
+
+A TO = 0 frame with no matching key is treated as an orphan response and dropped
+with `-ENOENT` — after the mctp-serial layer has already counted it, which is
+exactly the `rx_packets`-grows-but-responder-silent symptom. The forward path
+never hit this gate because Zephyr's *responder* replies with
+`MCTP_MESSAGE_TO_SRC` (TO = 1); and the libmctp↔libmctp Type 0 loopback sample
+has no kernel TO gate, so the bug was invisible in unit tests.
+
+**Fix (patch 0009).** In `subsys/pmci/pldm/pldm.c` `pldm_send_request_sync()`,
+change the requester transmit from `MCTP_MESSAGE_TO_DST` to
+`MCTP_MESSAGE_TO_SRC` (tag-owner = true → TO = 1). This is the only requester
+transmit in the file; the responder/CC-response paths already use
+`MCTP_MESSAGE_TO_SRC` and were correct.
+
+**Validation — reverse path end to end.** With the fix rebuilt into
+`prebuilts/zephyr.elf` and the two-QEMU bridge brought up (BMC link/addr/route
+set, `pldmd` stopped, the AF_MCTP base responder running on EID 8):
+
+Zephyr console:
+
+```
+<inf> serial_bridge: BMC GetTID -> 0x08 (try 50)
+<inf> serial_bridge: BMC GetPLDMTypes -> byte0=0x01
+<inf> serial_bridge: BMC GetPLDMVersion(BASE) -> 0.0.1
+<inf> serial_bridge: Reverse-direction PLDM probe to BMC complete
+```
+
+BMC `pldm_base_responder` log:
+
+```
+RX from EID 18 tag 0x08: iid=17 type=0 cmd=0x02   TX response cmd=0x02 len=5
+RX from EID 18 tag 0x08: iid=18 type=0 cmd=0x04   TX response cmd=0x04 len=12
+RX from EID 18 tag 0x08: iid=19 type=0 cmd=0x03   TX response cmd=0x03 len=13
+```
+
+`tag 0x08` confirms the TO bit is now set on the inbound requests, so the kernel
+routes them to the bound responder; `mctpserial0` counters read
+`rx_packets=3 / tx_packets=3` (before the fix, `tx` stayed 0). **Conclusion: the
+reverse direction now completes over the real BMC kernel AF_MCTP transport.**
+
 ## 11. Milestone plan
 
 - **M1** — Path A smoke: run existing `samples/subsys/pmci/mctp/{host,endpoint}` unmodified across two `qemu_riscv64` guests over UART pipe. Confirms libmctp works in our tree. *(≈0.5 day)*

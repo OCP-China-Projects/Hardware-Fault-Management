@@ -157,8 +157,21 @@ try:
             pass
         time.sleep(2)
     print(f"[*] login banner seen: {seen}", flush=True)
-    # Give sshd/dropbear + mctp-local.service a moment after login.
-    time.sleep(15)
+    # Poll for dropbear readiness instead of a fixed sleep: on this image
+    # sshd can come up well after the login banner, and transferring too
+    # early yields SSH rc=255 (connection refused).
+    print("[*] waiting for BMC SSH to accept connections...", flush=True)
+    ssh_deadline = time.time() + 180
+    ssh_ready = False
+    while time.time() < ssh_deadline:
+        rc, out = ssh_run("echo SSH_READY", timeout=15)
+        if rc == 0 and "SSH_READY" in out:
+            ssh_ready = True
+            break
+        time.sleep(3)
+    print(f"[*] BMC SSH ready: {ssh_ready}", flush=True)
+    # Let mctp-local.service settle after sshd is up.
+    time.sleep(5)
 
     def run(cmd, timeout=60):
         print(f"\n===== BMC# {cmd[:60]}... =====", flush=True)
@@ -269,7 +282,7 @@ echo '### DONE (responder left running for the reverse probe)'
     # before the reply arrives.
     print("\n[*] waiting for reverse-direction probe (Zephyr -> BMC)...",
           flush=True)
-    rev_deadline = time.time() + 120
+    rev_deadline = time.time() + 180
     rev_ok = False
     while time.time() < rev_deadline:
         try:
