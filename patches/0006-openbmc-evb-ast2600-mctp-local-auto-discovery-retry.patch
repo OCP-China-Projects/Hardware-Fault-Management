@@ -1,0 +1,51 @@
+OpenBMC evb-ast2600: let mctpd auto-discover the endpoint (drop manual route, retry SetupEndpoint)
+
+Rev-2 (PLDM Type 2) BMC-side delta on top of patch 0004. With the Zephyr node
+now answering baseline MCTP control commands (MR2 control responder), mctpd's
+SetupEndpoint enumerates the endpoint itself: it runs Get Endpoint ID, adopts
+EID 18, adds the kernel route and neighbour, queries Get Message Type Support,
+and publishes the endpoint on D-Bus so pldmd's platform-mc discovers and polls
+it. Two changes to mctp-local.service:
+
+  * Remove the manual "mctp route add 18 via mctpserial0" line. mctpd installs
+    the route on successful SetupEndpoint, so the line is redundant; it is also
+    the exact AF_MCTP netlink route/addr dump path that busy-loops on this
+    kernel image (see docs/pldm-mctp-i3c-design.md sec 10b/10c).
+  * Wrap the SetupEndpoint busctl call in a bounded retry loop (40 x 3 s). The
+    endpoint is a separate Zephyr QEMU instance that may boot after the BMC, so
+    the BusOwner call must be retried until the node answers.
+
+Note (environment): on this image mctpd's own startup netlink dump
+(fill_linkmap -> RTM_GETLINK|NLM_F_DUMP) busy-loops on the 6.6.92 AF_MCTP
+kernel, so fully-automatic discovery cannot complete here; the MR1+MR2 Zephyr
+responders were validated over the real kernel AF_MCTP transport by installing
+the route with a raw-netlink helper and addressing EID 18 directly with
+pldmtool (base GetTID/GetPLDMTypes + platform GetPDR/GetSensorReading all
+answered correctly). See docs sec 10c for the full evidence.
+
+---
+
+### meta-evb/.../recipes-phosphor/mctp/files/mctp-local.service (modified)
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
+index 533df4c..bbac59e 100644
+--- a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
+@@ -11,8 +11,13 @@ ExecStart=mctp link serial /dev/ttyS0
+ ExecStartPost=sleep 3
+ ExecStartPost=mctp link set mctpserial0 up
+ ExecStartPost=mctp addr add 8 dev mctpserial0
+-ExecStartPost=mctp route add 18 via mctpserial0
+-ExecStartPost=busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0
++# SetupEndpoint enumerates the remote endpoint (Get Endpoint ID over physical
++# addressing): mctpd then assigns/accepts its EID, adds the kernel route and
++# neighbour itself, queries Get Message Type Support, and publishes it on D-Bus
++# so pldmd's platform-mc discovers it. No manual "mctp route add" is needed
++# (and the CLI route/addr dump paths busy-loop on this image). The endpoint
++# (a Zephyr QEMU instance) may boot after the BMC, so retry until it answers.
++ExecStartPost=/bin/sh -c 'n=0; while [ $n -lt 40 ]; do busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0 && exit 0; n=$((n+1)); sleep 3; done; exit 1'
+ 
+ [Install]
+ WantedBy=mctpd.service
+
+--
+2.34.1

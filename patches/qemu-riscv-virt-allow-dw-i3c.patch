@@ -1,0 +1,55 @@
+QEMU riscv virt: allow-list the DesignWare I3C controller on the platform bus
+
+The RISC-V `virt` machine refuses to instantiate arbitrary `-device` types on
+its platform bus: each type must be added to `allowed_dynamic_sysbus_dev`, and
+the modules must be selected into the `RISCV_VIRT` Kconfig so they are compiled
+into `qemu-system-riscv64`. Two files change:
+
+  * hw/riscv/virt.c   — include the DW I3C header and register TYPE_DW_I3C via
+                        machine_class_allow_dynamic_sysbus_dev() in
+                        virt_machine_class_init().
+  * hw/riscv/Kconfig  — `select I3C` + `select DW_I3C` under config RISCV_VIRT.
+
+After rebuilding qemu-system-riscv64, `-device 'dw.i3c,help'` lists the nine
+DW I3C properties instead of "Device 'dw.i3c' not found", and the controller
+can be attached to the platform-bus MMIO window (0x04000000) for the Zephyr
+i3c_dw driver. See README Part 3 for the full build/attach flow.
+
+This targets an extracted QEMU 11.0.0 release tarball
+(https://download.qemu.org/); apply from the QEMU source tree top.
+
+---
+
+### hw/riscv/virt.c (modified)
+diff --git a/hw/riscv/virt.c b/hw/riscv/virt.c
+--- a/hw/riscv/virt.c
++++ b/hw/riscv/virt.c
+@@ -58,6 +58,7 @@
+ #include "qapi/qapi-visit-common.h"
+ #include "hw/virtio/virtio-iommu.h"
+ #include "hw/uefi/var-service-api.h"
++#include "hw/i3c/dw-i3c.h"
+ 
+ /* KVM AIA only supports APLIC MSI. APLIC Wired is always emulated by QEMU. */
+ static bool virt_use_kvm_aia_aplic_imsic(RISCVVirtAIAType aia_type)
+@@ -1937,6 +1938,7 @@
+ 
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_RAMFB_DEVICE);
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_UEFI_VARS_SYSBUS);
++    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_DW_I3C);
+ #ifdef CONFIG_TPM
+     machine_class_allow_dynamic_sysbus_dev(mc, TYPE_TPM_TIS_SYSBUS);
+ #endif
+
+### hw/riscv/Kconfig (modified)
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -68,5 +68,7 @@ config RISCV_VIRT
+     select PLATFORM_BUS
+     select ACPI
+     select ACPI_PCI
++    select I3C
++    select DW_I3C
+ 
+ config SHAKTI_C

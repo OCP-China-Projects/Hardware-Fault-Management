@@ -1,0 +1,787 @@
+From 5792dafbda396e057738309fd541d5f717fd6a2f Mon Sep 17 00:00:00 2001
+From: HFM <hfm@example.com>
+Date: Tue, 7 Jul 2026 13:21:21 +0800
+Subject: [PATCH] subsys/pmci/mctp: add MCTP-over-SMBus/I2C binding (DSP0237
+ v1.2)
+
+Add the standard DMTF DSP0237 MCTP-over-SMBus/I2C transport binding, wire
+compatible with the Linux kernel mctp-i2c driver used by OpenBMC.
+
+Packets are carried as SMBus block writes (command code 0x0F, byte count,
+source address, MCTP packet, trailing SMBus PEC). The guest is the bus
+controller for TX (i2c_write) and registers as an I2C target for RX; the
+target callbacks reassemble a block write and a single decode entry point
+(mctp_i2c_input) validates the command code, byte count and PEC before
+handing the packet to the MCTP core.
+
+An optional link_write hook lets the framed wire buffer be routed without a
+real controller, which the new pldm/i2c_loopback sample uses to round-trip
+PLDM Type 0 through the full DSP0237 framing/PEC path. Verified on
+qemu_riscv32.
+---
+ include/zephyr/pmci/mctp/mctp_i2c.h           | 162 +++++++++++
+ .../pmci/pldm/i2c_loopback/CMakeLists.txt     |   9 +
+ .../subsys/pmci/pldm/i2c_loopback/README.rst  |  55 ++++
+ .../subsys/pmci/pldm/i2c_loopback/prj.conf    |  18 ++
+ .../subsys/pmci/pldm/i2c_loopback/sample.yaml |  24 ++
+ .../subsys/pmci/pldm/i2c_loopback/src/main.c  | 134 +++++++++
+ subsys/pmci/mctp/CMakeLists.txt               |   1 +
+ subsys/pmci/mctp/Kconfig                      |  22 ++
+ subsys/pmci/mctp/mctp_i2c.c                   | 256 ++++++++++++++++++
+ 9 files changed, 681 insertions(+)
+ create mode 100644 include/zephyr/pmci/mctp/mctp_i2c.h
+ create mode 100644 samples/subsys/pmci/pldm/i2c_loopback/CMakeLists.txt
+ create mode 100644 samples/subsys/pmci/pldm/i2c_loopback/README.rst
+ create mode 100644 samples/subsys/pmci/pldm/i2c_loopback/prj.conf
+ create mode 100644 samples/subsys/pmci/pldm/i2c_loopback/sample.yaml
+ create mode 100644 samples/subsys/pmci/pldm/i2c_loopback/src/main.c
+ create mode 100644 subsys/pmci/mctp/mctp_i2c.c
+
+diff --git a/include/zephyr/pmci/mctp/mctp_i2c.h b/include/zephyr/pmci/mctp/mctp_i2c.h
+new file mode 100644
+index 00000000000..1947985f24e
+--- /dev/null
++++ b/include/zephyr/pmci/mctp/mctp_i2c.h
+@@ -0,0 +1,162 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_MCTP_I2C_H_
++#define ZEPHYR_MCTP_I2C_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/i2c.h>
++#include <libmctp.h>
++
++/**
++ * @brief DSP0237 v1.2 — MCTP over SMBus/I2C transport binding.
++ *
++ * Every MCTP packet travels as an SMBus Block Write:
++ *
++ *   [ dst_addr<<1|W ] [ 0x0F ] [ byte_count ] [ src_addr<<1|1 ]
++ *       [ MCTP header + payload ] [ PEC ]
++ *
++ * The destination/write address and the trailing PEC are handled by the
++ * transport; @c byte_count counts the source-address byte plus the MCTP
++ * packet (i.e. everything between @c byte_count and @c PEC).  The PEC is an
++ * SMBus CRC-8 (poly 0x07, seed 0x00) taken over the receiver's write address
++ * followed by every byte up to but excluding the PEC.
++ *
++ * TX side:  the Zephyr guest is the bus controller and issues an
++ *           @c i2c_write() (SMBus block write) to the peer address.
++ * RX side:  the guest registers as an I2C target; the peer controller writes
++ *           a block to our address and the target callbacks reassemble it.
++ *
++ * On both paths the fully framed wire buffer is decoded by a single entry
++ * point, @ref mctp_i2c_input, so the framing/PEC logic can be exercised in a
++ * host loopback without an I2C controller that supports target mode.
++ */
++
++/** DSP0237 §6.3 — SMBus command code identifying an MCTP block write. */
++#define MCTP_I2C_COMMAND_CODE 0x0F
++
++/** Maximum MCTP packet body (header + payload) carried in one frame. */
++#define MCTP_I2C_MTU CONFIG_MCTP_I2C_MTU
++
++/*
++ * Framing overhead inside the i2c_write() payload: command code, byte count,
++ * source address and the trailing PEC.
++ */
++#define MCTP_I2C_FRAME_OVERHEAD 4U
++
++/** Largest wire frame handed to i2c_write() / seen by the target callbacks. */
++#define MCTP_I2C_MAX_FRAME (MCTP_I2C_MTU + MCTP_I2C_FRAME_OVERHEAD)
++
++/** @cond INTERNAL_HIDDEN */
++struct mctp_binding_i2c;
++/** INTERNAL_HIDDEN @endcond */
++
++/**
++ * @brief Optional link-layer write hook.
++ *
++ * When set, @ref mctp_i2c_tx calls this instead of @c i2c_write, handing over
++ * the fully framed SMBus block-write buffer (command code .. PEC). Used by the
++ * host loopback sample to shuttle frames straight into a peer's RX path; leave
++ * @c NULL to use the real I2C controller.
++ */
++typedef int (*mctp_i2c_link_write_fn)(struct mctp_binding_i2c *binding,
++				      const uint8_t *frame, size_t len);
++
++/**
++ * @brief MCTP over SMBus/I2C binding descriptor.
++ */
++struct mctp_binding_i2c {
++	/** @cond INTERNAL_HIDDEN */
++	struct mctp_binding binding;
++
++	/** I2C controller device (NULL in pure loopback mode). */
++	const struct device *i2c;
++
++	/** Target registration used to receive peer block writes. */
++	struct i2c_target_config target_cfg;
++
++	/** Our own 7-bit I2C address (target-receiver address). */
++	uint8_t own_addr;
++
++	/** Peer's 7-bit I2C address (block-write destination). */
++	uint8_t dest_addr;
++
++	/** Optional TX hook; when NULL, i2c_write() is used. */
++	mctp_i2c_link_write_fn link_write;
++
++	/** User context for @ref link_write (e.g. the loopback peer). */
++	void *link_ctx;
++
++	/** Staging buffer for the outgoing wire frame. */
++	uint8_t tx_buf[MCTP_I2C_MAX_FRAME];
++
++	/** Reassembly buffer for an incoming block write. */
++	uint8_t rx_buf[MCTP_I2C_MAX_FRAME];
++
++	/** Number of bytes accumulated in @c rx_buf. */
++	size_t rx_idx;
++
++	/** Whether an addressed write is currently in progress. */
++	bool rx_active;
++
++	/** Whether @c rx_buf overflowed and the frame must be dropped. */
++	bool rx_overflow;
++	/** INTERNAL_HIDDEN @endcond */
++};
++
++/** @cond INTERNAL_HIDDEN */
++int mctp_i2c_start(struct mctp_binding *binding);
++int mctp_i2c_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt);
++
++extern const struct i2c_target_callbacks mctp_i2c_target_callbacks;
++/** INTERNAL_HIDDEN @endcond */
++
++/**
++ * @brief Feed a complete DSP0237 wire frame into the binding's RX path.
++ *
++ * @param binding  Binding whose bus this frame arrived on.
++ * @param frame    Block-write body: command code, byte count, source address,
++ *                 MCTP packet and PEC.
++ * @param len      Length of @p frame in bytes.
++ *
++ * @return 0 on success and after the MCTP packet is delivered upward, or a
++ *         negative errno if the frame is malformed or fails PEC.
++ */
++int mctp_i2c_input(struct mctp_binding_i2c *binding, const uint8_t *frame,
++		   size_t len);
++
++/**
++ * @brief Statically define an MCTP over SMBus/I2C binding.
++ *
++ * @param _name  Symbolic name of the binding variable.
++ * @param _i2c   Pointer to the I2C controller @c device (NULL for loopback).
++ * @param _own   Our own 7-bit I2C (target) address.
++ * @param _dest  Peer's 7-bit I2C address for block writes.
++ */
++#define MCTP_I2C_DEFINE(_name, _i2c, _own, _dest)                              \
++	struct mctp_binding_i2c _name = {                                      \
++		.binding = {                                                   \
++			.name = STRINGIFY(_name),                             \
++			.version = 1,                                         \
++			.pkt_size = MCTP_PACKET_SIZE(MCTP_BTU),               \
++			.pkt_header = 0,                                      \
++			.pkt_trailer = 0,                                     \
++			.start = mctp_i2c_start,                             \
++			.tx = mctp_i2c_tx,                                   \
++		},                                                            \
++		.i2c = (_i2c),                                                \
++		.own_addr = (_own),                                           \
++		.dest_addr = (_dest),                                         \
++		.target_cfg = {                                               \
++			.address = (_own),                                   \
++			.callbacks = &mctp_i2c_target_callbacks,             \
++		},                                                            \
++	}
++
++#endif /* ZEPHYR_MCTP_I2C_H_ */
+diff --git a/samples/subsys/pmci/pldm/i2c_loopback/CMakeLists.txt b/samples/subsys/pmci/pldm/i2c_loopback/CMakeLists.txt
+new file mode 100644
+index 00000000000..455e8e5b13a
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/i2c_loopback/CMakeLists.txt
+@@ -0,0 +1,9 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(pldm_i2c_loopback)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/subsys/pmci/pldm/i2c_loopback/README.rst b/samples/subsys/pmci/pldm/i2c_loopback/README.rst
+new file mode 100644
+index 00000000000..783284ebf35
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/i2c_loopback/README.rst
+@@ -0,0 +1,55 @@
++.. zephyr:code-sample:: pldm_i2c_loopback
++   :name: PLDM Type 0 over MCTP over SMBus/I2C (loopback)
++
++   Round-trip PLDM Type 0 across the DSP0237 MCTP-over-SMBus/I2C binding.
++
++Overview
++********
++
++This sample layers the full PLDM stack (``subsys/pmci/pldm``) on top of the
++standard DMTF **DSP0237** MCTP-over-SMBus/I2C transport binding
++(``CONFIG_MCTP_I2C``).
++
++Two ``struct mctp_binding_i2c`` instances are cross-wired through the binding's
++``link_write`` hook. Every packet one side transmits is emitted as a real
++SMBus block write frame::
++
++   [ 0x0F ] [ byte_count ] [ src_addr<<1|1 ] [ MCTP packet ] [ PEC ]
++
++and delivered verbatim to the peer's ``mctp_i2c_input()``, which performs the
++same command-code check, ``byte_count`` validation and SMBus PEC verification
++that the real I2C target-mode receive path uses. This exercises the entire
++DSP0237 wire format without needing an I2C controller that supports target
++mode (which QEMU does not yet provide).
++
++The requester then asks the responder for its TID, supported PLDM types and
++the base-type version, mirroring the in-memory ``type0_loopback`` sample but
++over a standards-compliant transport frame.
++
++Building and Running
++********************
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/subsys/pmci/pldm/i2c_loopback
++   :board: qemu_riscv32
++   :goals: build run
++   :compact:
++
++Sample Output
++=============
++
++.. code-block:: console
++
++   *** Booting Zephyr OS build v4.3.0 ***
++   GetTID -> 0x01
++   GetPLDMTypes -> byte0=0x01
++   GetPLDMVersion(BASE) -> 1.1.0
++   PLDM over MCTP over I2C loopback OK
++
++Wire compatibility
++******************
++
++The framing produced by this binding matches the Linux kernel ``mctp-i2c``
++driver used by OpenBMC. Connecting two live QEMU instances still requires an
++I2C controller model with target-mode support (not yet in upstream QEMU); the
++UART / ``mctp-serial`` bridge remains the practical inter-QEMU path today.
+diff --git a/samples/subsys/pmci/pldm/i2c_loopback/prj.conf b/samples/subsys/pmci/pldm/i2c_loopback/prj.conf
+new file mode 100644
+index 00000000000..79c43c7b8d7
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/i2c_loopback/prj.conf
+@@ -0,0 +1,18 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++CONFIG_MCTP=y
++CONFIG_MCTP_HEAP_SIZE=4096
++CONFIG_MCTP_I2C=y
++
++CONFIG_I2C=y
++
++CONFIG_PLDM_SUBSYS=y
++CONFIG_PLDM_RESPONDER=y
++CONFIG_PLDM_REQUESTER=y
++CONFIG_PLDM_TYPE_BASE=y
++
++CONFIG_LOG=y
++CONFIG_LOG_BUFFER_SIZE=4096
++CONFIG_PLDM_LOG_LEVEL_INF=y
++CONFIG_MAIN_STACK_SIZE=4096
+diff --git a/samples/subsys/pmci/pldm/i2c_loopback/sample.yaml b/samples/subsys/pmci/pldm/i2c_loopback/sample.yaml
+new file mode 100644
+index 00000000000..f9651b6ebe2
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/i2c_loopback/sample.yaml
+@@ -0,0 +1,24 @@
++sample:
++  description: PLDM Type 0 (DSP0240) requester/responder round-trip carried over
++    the standard DSP0237 MCTP-over-SMBus/I2C binding, looped back in memory.
++  name: pldm_i2c_loopback
++common:
++  tags:
++    - pmci
++    - mctp
++    - pldm
++    - i2c
++tests:
++  sample.pmci.pldm.i2c_loopback:
++    integration_platforms:
++      - qemu_riscv32
++      - qemu_x86
++    harness: console
++    harness_config:
++      type: multi_line
++      ordered: true
++      regex:
++        - "GetTID -> 0x[0-9a-fA-F]+"
++        - "GetPLDMTypes -> byte0=0x01"
++        - "GetPLDMVersion\\(BASE\\) -> [0-9]+\\.[0-9]+\\.[0-9]+"
++        - "PLDM over MCTP over I2C loopback OK"
+diff --git a/samples/subsys/pmci/pldm/i2c_loopback/src/main.c b/samples/subsys/pmci/pldm/i2c_loopback/src/main.c
+new file mode 100644
+index 00000000000..4c967b55214
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/i2c_loopback/src/main.c
+@@ -0,0 +1,134 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM Type 0 over the standard DSP0237 MCTP-over-SMBus/I2C binding.
++ *
++ * Two real struct mctp_binding_i2c instances are wired together through the
++ * binding's link_write hook: whatever one side would put on the wire as an
++ * SMBus block write (command code 0x0F, byte count, source address, MCTP
++ * packet, PEC) is handed verbatim to the peer's mctp_i2c_input(), which runs
++ * the exact framing/PEC decode the real I2C target path uses. This exercises
++ * the full DSP0237 wire format plus the whole PLDM stack without needing an
++ * I2C controller that supports target mode.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/logging/log.h>
++#include <zephyr/sys/util.h>
++
++#include <libmctp.h>
++#include <libpldm/base.h>
++#include <libpldm/pldm_types.h>
++
++#include <zephyr/pmci/mctp/mctp_i2c.h>
++#include <zephyr/pmci/pldm/pldm.h>
++#include <zephyr/pmci/pldm/pldm_base.h>
++
++LOG_MODULE_REGISTER(sample, LOG_LEVEL_INF);
++
++#define EID_REQUESTER 0x10
++#define EID_RESPONDER 0x20
++
++#define I2C_ADDR_REQUESTER 0x30
++#define I2C_ADDR_RESPONDER 0x31
++
++/* i2c == NULL: pure loopback, RX is driven by the link_write hook below. */
++MCTP_I2C_DEFINE(bind_req, NULL, I2C_ADDR_REQUESTER, I2C_ADDR_RESPONDER);
++MCTP_I2C_DEFINE(bind_resp, NULL, I2C_ADDR_RESPONDER, I2C_ADDR_REQUESTER);
++
++/*
++ * Deliver a framed block write into the peer binding's decode path. The peer's
++ * own_addr must match this binding's dest_addr for the PEC (computed over the
++ * destination write address) to verify — which is exactly how the two static
++ * addresses above are paired.
++ */
++static int loopback_link_write(struct mctp_binding_i2c *from,
++			       const uint8_t *frame, size_t len)
++{
++	struct mctp_binding_i2c *peer = from->link_ctx;
++
++	return mctp_i2c_input(peer, frame, len);
++}
++
++static struct mctp *mctp_req, *mctp_resp;
++static struct pldm_ctx ctx_req, ctx_resp;
++
++int main(void)
++{
++	uint8_t types[8] = { 0 };
++	uint8_t tid = 0;
++	ver32_t ver;
++	int rc;
++
++	mctp_set_alloc_ops(malloc, free, realloc);
++
++	mctp_req = mctp_init();
++	mctp_resp = mctp_init();
++	if (mctp_req == NULL || mctp_resp == NULL) {
++		LOG_ERR("mctp_init failed");
++		return -1;
++	}
++
++	/* Cross-wire the two bindings' link hooks. */
++	bind_req.link_write = loopback_link_write;
++	bind_req.link_ctx = &bind_resp;
++	bind_resp.link_write = loopback_link_write;
++	bind_resp.link_ctx = &bind_req;
++
++	rc = mctp_register_bus(mctp_req, &bind_req.binding, EID_REQUESTER);
++	if (rc != 0) {
++		LOG_ERR("mctp_register_bus(req) rc=%d", rc);
++		return -1;
++	}
++	rc = mctp_register_bus(mctp_resp, &bind_resp.binding, EID_RESPONDER);
++	if (rc != 0) {
++		LOG_ERR("mctp_register_bus(resp) rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_ctx_init(&ctx_req, mctp_req, EID_REQUESTER);
++	if (rc != 0) {
++		LOG_ERR("pldm_ctx_init(req) rc=%d", rc);
++		return -1;
++	}
++	rc = pldm_ctx_init(&ctx_resp, mctp_resp, EID_RESPONDER);
++	if (rc != 0) {
++		LOG_ERR("pldm_ctx_init(resp) rc=%d", rc);
++		return -1;
++	}
++	rc = pldm_base_responder_register(&ctx_resp);
++	if (rc != 0) {
++		LOG_ERR("pldm_base_responder_register rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_base_get_tid_sync(&ctx_req, EID_RESPONDER, &tid);
++	if (rc != 0) {
++		LOG_ERR("GetTID rc=%d", rc);
++		return -1;
++	}
++	printk("GetTID -> 0x%02x\n", tid);
++
++	rc = pldm_base_get_types_sync(&ctx_req, EID_RESPONDER, types);
++	if (rc != 0) {
++		LOG_ERR("GetPLDMTypes rc=%d", rc);
++		return -1;
++	}
++	printk("GetPLDMTypes -> byte0=0x%02x\n", types[0]);
++
++	rc = pldm_base_get_version_sync(&ctx_req, EID_RESPONDER, PLDM_BASE, &ver);
++	if (rc != 0) {
++		LOG_ERR("GetPLDMVersion rc=%d", rc);
++		return -1;
++	}
++	printk("GetPLDMVersion(BASE) -> %u.%u.%u\n", ver.major & 0x0f,
++	       ver.minor & 0x0f, ver.update & 0x0f);
++
++	printk("PLDM over MCTP over I2C loopback OK\n");
++	return 0;
++}
+diff --git a/subsys/pmci/mctp/CMakeLists.txt b/subsys/pmci/mctp/CMakeLists.txt
+index e804f607807..f1082d23248 100644
+--- a/subsys/pmci/mctp/CMakeLists.txt
++++ b/subsys/pmci/mctp/CMakeLists.txt
+@@ -3,6 +3,7 @@ zephyr_library_sources(mctp_memory.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_UART mctp_uart.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_CONTROLLER mctp_i2c_gpio_controller.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_TARGET mctp_i2c_gpio_target.c)
++zephyr_library_sources_ifdef(CONFIG_MCTP_I2C mctp_i2c.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I3C mctp_i3c.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_USB mctp_usb.c)
+ zephyr_linker_sources_ifdef(CONFIG_MCTP_USB SECTIONS mctp_usb.ld)
+diff --git a/subsys/pmci/mctp/Kconfig b/subsys/pmci/mctp/Kconfig
+index c6b68fa002a..42da7de4f09 100644
+--- a/subsys/pmci/mctp/Kconfig
++++ b/subsys/pmci/mctp/Kconfig
+@@ -43,6 +43,28 @@ config MCTP_I2C_GPIO_TARGET
+ 	  Build the MCTP I2C+GPIO target binding to use MCTP over Zephyr's I2C target
+ 	  interface and GPIO to signal writes to the bus controller.
+ 
++config MCTP_I2C
++	bool "MCTP over SMBus/I2C Binding (DSP0237)"
++	depends on I2C
++	help
++	  Build the standard DMTF DSP0237 MCTP-over-SMBus/I2C binding. Packets
++	  are carried as SMBus block writes (command code 0x0F) with a trailing
++	  SMBus PEC. The Zephyr guest is the bus controller for TX and registers
++	  as an I2C target to receive block writes from the peer. This binding is
++	  wire-compatible with the Linux kernel mctp-i2c driver used by OpenBMC.
++
++config MCTP_I2C_MTU
++	int "Maximum I2C MCTP packet body size (bytes)"
++	depends on MCTP_I2C
++	range 32 254
++	default 68
++	help
++	  Maximum size, in bytes, of the MCTP packet body (MCTP header plus
++	  payload) carried in one SMBus block write, excluding the command code,
++	  byte count, source address and trailing PEC. DSP0237 caps the SMBus
++	  block at 255 bytes; 68 bytes (4 B MCTP header + 64 B baseline
++	  transmission unit) is the interoperable default.
++
+ config MCTP_I3C
+ 	bool "MCTP I3C Binding"
+ 	depends on I3C
+diff --git a/subsys/pmci/mctp/mctp_i2c.c b/subsys/pmci/mctp/mctp_i2c.c
+new file mode 100644
+index 00000000000..30fe014a5c0
+--- /dev/null
++++ b/subsys/pmci/mctp/mctp_i2c.c
+@@ -0,0 +1,256 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * DSP0237 v1.2 — MCTP over SMBus/I2C transport binding for Zephyr.
++ *
++ * Wire frame (SMBus Block Write, command code 0x0F):
++ *
++ *   [ dest<<1|W ] [ 0x0F ] [ byte_count ] [ src<<1|1 ] [ MCTP packet ] [ PEC ]
++ *
++ * byte_count counts the source-address byte plus the MCTP packet. The PEC is
++ * an SMBus CRC-8 (poly 0x07, seed 0x00) over the destination write address
++ * and every subsequent byte up to (but not including) the PEC.
++ *
++ * TX: the guest is the bus controller and issues i2c_write() to the peer.
++ * RX: the guest is registered as an I2C target; the peer's block write is
++ *     reassembled by the target callbacks and decoded by mctp_i2c_input().
++ */
++
++#include <string.h>
++#include <zephyr/kernel.h>
++#include <zephyr/sys/__assert.h>
++#include <zephyr/drivers/i2c.h>
++#include <zephyr/pmci/mctp/mctp_i2c.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(mctp_i2c, CONFIG_MCTP_LOG_LEVEL);
++
++static inline struct mctp_binding_i2c *binding_to_i2c(struct mctp_binding *b)
++{
++	return CONTAINER_OF(b, struct mctp_binding_i2c, binding);
++}
++
++/* SMBus PEC: CRC-8, poly 0x07, seed 0x00 (DSP0237 §6.3). */
++static uint8_t mctp_i2c_pec(uint8_t crc, const uint8_t *buf, size_t len)
++{
++	for (size_t i = 0; i < len; i++) {
++		crc ^= buf[i];
++		for (int b = 0; b < 8; b++) {
++			crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07)
++					   : (uint8_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++/*
++ * Decode a fully framed block write (command code .. PEC) and, if valid, hand
++ * the embedded MCTP packet to the core. Shared by the real target-mode RX path
++ * and the loopback sample so the framing rules live in one place.
++ */
++int mctp_i2c_input(struct mctp_binding_i2c *b, const uint8_t *frame, size_t len)
++{
++	struct mctp_pktbuf *pkt;
++	uint8_t byte_count;
++	uint8_t pec, expected;
++	size_t pkt_len;
++
++	/* command code + byte count + source addr + at least an MCTP hdr + PEC */
++	if (len < MCTP_I2C_FRAME_OVERHEAD + sizeof(struct mctp_hdr)) {
++		LOG_WRN("i2c rx: short frame (%zu bytes)", len);
++		return -EBADMSG;
++	}
++
++	if (frame[0] != MCTP_I2C_COMMAND_CODE) {
++		LOG_WRN("i2c rx: bad command 0x%02x", frame[0]);
++		return -EBADMSG;
++	}
++
++	byte_count = frame[1];
++	/* byte_count covers the source-address byte + MCTP packet. */
++	if ((size_t)byte_count + 3U != len) {
++		LOG_WRN("i2c rx: byte_count %u != frame %zu", byte_count, len);
++		return -EBADMSG;
++	}
++
++	/* PEC covers dest write address + everything up to the PEC byte. */
++	uint8_t dest_wr = (uint8_t)(b->own_addr << 1);
++
++	pec = mctp_i2c_pec(0, &dest_wr, 1);
++	pec = mctp_i2c_pec(pec, frame, len - 1);
++	expected = frame[len - 1];
++	if (pec != expected) {
++		LOG_WRN("i2c rx: PEC got=0x%02x exp=0x%02x", expected, pec);
++		return -EBADMSG;
++	}
++
++	/* MCTP packet = frame minus [cmd][byte_count][src_addr] and [PEC]. */
++	pkt_len = len - MCTP_I2C_FRAME_OVERHEAD;
++
++	pkt = mctp_pktbuf_alloc(&b->binding, 0);
++	if (pkt == NULL) {
++		LOG_ERR("i2c rx: pktbuf alloc failed");
++		return -ENOMEM;
++	}
++	if (mctp_pktbuf_push(pkt, &frame[3], pkt_len) != 0) {
++		LOG_ERR("i2c rx: pktbuf push failed");
++		mctp_pktbuf_free(pkt);
++		return -ENOMEM;
++	}
++
++	mctp_bus_rx(&b->binding, pkt);
++	return 0;
++}
++
++/*
++ * I2C target callbacks. The peer controller addresses us and streams the
++ * block-write bytes (command code, byte count, source, packet, PEC) via
++ * write_received; on stop we decode the accumulated frame.
++ */
++static int mctp_i2c_target_write_requested(struct i2c_target_config *cfg)
++{
++	struct mctp_binding_i2c *b =
++		CONTAINER_OF(cfg, struct mctp_binding_i2c, target_cfg);
++
++	b->rx_idx = 0;
++	b->rx_active = true;
++	b->rx_overflow = false;
++	return 0;
++}
++
++static int mctp_i2c_target_write_received(struct i2c_target_config *cfg,
++					  uint8_t val)
++{
++	struct mctp_binding_i2c *b =
++		CONTAINER_OF(cfg, struct mctp_binding_i2c, target_cfg);
++
++	if (!b->rx_active) {
++		return 0;
++	}
++	if (b->rx_idx >= sizeof(b->rx_buf)) {
++		b->rx_overflow = true;
++		return -ENOMEM;
++	}
++	b->rx_buf[b->rx_idx++] = val;
++	return 0;
++}
++
++static int mctp_i2c_target_stop(struct i2c_target_config *cfg)
++{
++	struct mctp_binding_i2c *b =
++		CONTAINER_OF(cfg, struct mctp_binding_i2c, target_cfg);
++
++	if (!b->rx_active) {
++		return 0;
++	}
++	b->rx_active = false;
++
++	if (b->rx_overflow) {
++		LOG_WRN("i2c rx: frame overflow, dropping");
++		return 0;
++	}
++
++	(void)mctp_i2c_input(b, b->rx_buf, b->rx_idx);
++	return 0;
++}
++
++/* MCTP-over-I2C never reads from the target; provide stubs the API requires. */
++static int mctp_i2c_target_read_requested(struct i2c_target_config *cfg,
++					  uint8_t *val)
++{
++	ARG_UNUSED(cfg);
++	*val = 0xFF;
++	return 0;
++}
++
++static int mctp_i2c_target_read_processed(struct i2c_target_config *cfg,
++					  uint8_t *val)
++{
++	ARG_UNUSED(cfg);
++	*val = 0xFF;
++	return 0;
++}
++
++const struct i2c_target_callbacks mctp_i2c_target_callbacks = {
++	.write_requested = mctp_i2c_target_write_requested,
++	.write_received = mctp_i2c_target_write_received,
++	.read_requested = mctp_i2c_target_read_requested,
++	.read_processed = mctp_i2c_target_read_processed,
++	.stop = mctp_i2c_target_stop,
++};
++
++/*
++ * Bring the binding up. With a real controller we also register as a target so
++ * the peer can write to us. In loopback mode (i2c == NULL) there is nothing to
++ * register; RX arrives via mctp_i2c_input() driven by the link_write hook.
++ */
++int mctp_i2c_start(struct mctp_binding *binding)
++{
++	struct mctp_binding_i2c *b = binding_to_i2c(binding);
++	int ret;
++
++	if (b->i2c != NULL) {
++		if (!device_is_ready(b->i2c)) {
++			LOG_ERR("i2c controller not ready");
++			return -ENODEV;
++		}
++		ret = i2c_target_register(b->i2c, &b->target_cfg);
++		if (ret != 0 && ret != -ENOSYS) {
++			LOG_ERR("i2c_target_register failed: %d", ret);
++			return ret;
++		}
++	}
++
++	mctp_binding_set_tx_enabled(binding, true);
++	return 0;
++}
++
++/*
++ * Transmit one MCTP packet as an SMBus block write. Builds
++ * [cmd][byte_count][src_addr][packet][PEC] into tx_buf and either invokes the
++ * link_write hook (loopback) or issues i2c_write() to the peer.
++ */
++int mctp_i2c_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt)
++{
++	struct mctp_binding_i2c *b = binding_to_i2c(binding);
++	size_t pkt_len = mctp_pktbuf_size(pkt);
++	size_t frame_len;
++	uint8_t byte_count;
++	uint8_t dest_wr;
++	uint8_t pec;
++
++	if (pkt_len == 0 || pkt_len > MCTP_I2C_MTU) {
++		LOG_ERR("i2c tx: bad packet len %zu", pkt_len);
++		return -EMSGSIZE;
++	}
++
++	/* byte_count = source-address byte + MCTP packet. */
++	byte_count = (uint8_t)(pkt_len + 1U);
++
++	b->tx_buf[0] = MCTP_I2C_COMMAND_CODE;
++	b->tx_buf[1] = byte_count;
++	b->tx_buf[2] = (uint8_t)((b->own_addr << 1) | 0x01);
++	memcpy(&b->tx_buf[3], mctp_pktbuf_hdr(pkt), pkt_len);
++
++	frame_len = pkt_len + 3U; /* cmd + byte_count + src + packet */
++
++	/* PEC = CRC-8 over dest write addr + frame so far. */
++	dest_wr = (uint8_t)(b->dest_addr << 1);
++	pec = mctp_i2c_pec(0, &dest_wr, 1);
++	pec = mctp_i2c_pec(pec, b->tx_buf, frame_len);
++	b->tx_buf[frame_len] = pec;
++	frame_len += 1U;
++
++	if (b->link_write != NULL) {
++		return b->link_write(b, b->tx_buf, frame_len);
++	}
++
++	if (b->i2c == NULL) {
++		LOG_ERR("i2c tx: no controller and no link hook");
++		return -ENODEV;
++	}
++
++	return i2c_write(b->i2c, b->tx_buf, frame_len, b->dest_addr);
++}
+-- 
+2.25.1
+

@@ -1,0 +1,1049 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HFM <hfm@example.com>
+Date: Wed, 15 Jul 2026 10:40:25 +0800
+Subject: [PATCH 7/8] subsys/pmci/pldm: add DSP0248 Type 2 (Platform
+ Monitoring) responder
+
+Extend the PLDM subsystem with a DMTF DSP0248 Type 2 responder so a
+management controller (e.g. OpenBMC's pldmd platform-mc) can discover a
+sensor terminus and poll it.
+
+Key pieces:
+
+  * include/zephyr/pmci/pldm/pldm_platform.h - public API:
+      pldm_platform_add_numeric_sensor(), pldm_platform_responder_register().
+
+  * subsys/pmci/pldm/pldm_platform.c - Type 2 responder.
+      Serves a compile-time PDR repository (one Terminus Locator PDR plus
+      one Numeric Sensor PDR per registered sensor) through
+      GetPDRRepositoryInfo (0x50) / GetPDR (0x51); GetSensorReading (0x11)
+      returns live values via each sensor's read callback;
+      GetStateSensorReadings and PlatformEventMessage are handled minimally.
+      Encode/decode is delegated to openbmc/libpldm.
+
+  * subsys/pmci/pldm/pldm_base.c - discovery plumbing.
+      pldm_base_register_type() lets a non-base type register its version
+      and command bitmap so the Type 0 discovery commands (GetPLDMTypes /
+      GetPLDMVersion / GetPLDMCommands) advertise it. The Type 2 responder
+      calls this at registration time.
+
+  * subsys/pmci/pldm/pldm.c - ISR-safety fix.
+      The requester slot lock is delivered from libmctp's RX path, which
+      can run in interrupt context, so req_lock is switched from k_mutex to
+      k_spinlock (a mutex may not be locked in an ISR).
+
+  * Kconfig: CONFIG_PLDM_TYPE_PLATFORM (selects REQUIRES_STD_C11 for the
+    libpldm platform encoders) and CONFIG_PLDM_PLATFORM_MAX_SENSORS.
+
+Signed-off-by: HFM <hfm@example.com>
+---
+ include/zephyr/pmci/pldm/pldm.h          |   2 +-
+ include/zephyr/pmci/pldm/pldm_base.h     |  18 +
+ include/zephyr/pmci/pldm/pldm_platform.h |  96 ++++
+ subsys/pmci/pldm/CMakeLists.txt          |   1 +
+ subsys/pmci/pldm/Kconfig                 |  22 +
+ subsys/pmci/pldm/pldm.c                  |  21 +-
+ subsys/pmci/pldm/pldm_base.c             | 123 ++++-
+ subsys/pmci/pldm/pldm_platform.c         | 564 +++++++++++++++++++++++
+ 8 files changed, 822 insertions(+), 25 deletions(-)
+ create mode 100644 include/zephyr/pmci/pldm/pldm_platform.h
+ create mode 100644 subsys/pmci/pldm/pldm_platform.c
+
+diff --git a/include/zephyr/pmci/pldm/pldm.h b/include/zephyr/pmci/pldm/pldm.h
+index 9db0ac85084..7d60cf5b9cd 100644
+--- a/include/zephyr/pmci/pldm/pldm.h
++++ b/include/zephyr/pmci/pldm/pldm.h
+@@ -70,7 +70,7 @@ struct pldm_ctx {
+ #endif
+ 
+ #if defined(CONFIG_PLDM_REQUESTER)
+-	struct k_mutex req_lock;
++	struct k_spinlock req_slock;
+ 	struct k_sem req_slot_sem;
+ 	struct pldm_request_slot {
+ 		bool used;
+diff --git a/include/zephyr/pmci/pldm/pldm_base.h b/include/zephyr/pmci/pldm/pldm_base.h
+index 318581f307a..ebb0b253927 100644
+--- a/include/zephyr/pmci/pldm/pldm_base.h
++++ b/include/zephyr/pmci/pldm/pldm_base.h
+@@ -38,6 +38,24 @@ uint8_t pldm_base_get_tid(void);
+  */
+ void pldm_base_set_tid(uint8_t tid);
+ 
++/**
++ * @brief Announce an additional PLDM type to the Type 0 discovery commands.
++ *
++ * After this call GetPLDMTypes advertises @p pldm_type, GetPLDMVersion for it
++ * returns @p version, and GetPLDMCommands for it returns @p commands. Intended
++ * to be called by other type responders (e.g. Type 2) at registration time so
++ * a management controller can discover them via the base discovery commands.
++ *
++ * @param pldm_type PLDM type number (must not be PLDM_BASE, < PLDM_MAX_TYPES).
++ * @param version   Version reported for the type.
++ * @param commands  32-byte command bitmap (bit N of byte M => command M*8+N).
++ *
++ * @return 0 on success, -EINVAL on a bad argument, -ENOSPC if the registry is
++ *         full.
++ */
++int pldm_base_register_type(uint8_t pldm_type, const ver32_t *version,
++			    const bitfield8_t commands[32]);
++
+ #if defined(CONFIG_PLDM_REQUESTER)
+ /** Send GetTID and populate @p tid on success. */
+ int pldm_base_get_tid_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
+diff --git a/include/zephyr/pmci/pldm/pldm_platform.h b/include/zephyr/pmci/pldm/pldm_platform.h
+new file mode 100644
+index 00000000000..cc94657a565
+--- /dev/null
++++ b/include/zephyr/pmci/pldm/pldm_platform.h
+@@ -0,0 +1,96 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_PLATFORM_H_
++#define ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_PLATFORM_H_
++
++#include <stdint.h>
++#include <zephyr/pmci/pldm/pldm.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @file
++ * @brief DSP0248 PLDM Type 2 (Platform Monitoring and Control) responder.
++ *
++ * Implements the terminus side of a small platform-monitoring surface so a
++ * management controller (e.g. OpenBMC pldmd platform-mc) can discover and
++ * poll sensors hosted by this node:
++ *   - GetPDRRepositoryInfo (0x50) / GetPDR (0x51): expose a compile-time PDR
++ *     repository holding a Terminus Locator PDR plus one Numeric Sensor PDR
++ *     per registered sensor.
++ *   - GetSensorReading (0x11): return the live value of a numeric sensor.
++ *   - GetStateSensorReadings (0x21): minimal single-field state readback.
++ *   - PlatformEventMessage (0x0a): accept and acknowledge inbound events.
++ *
++ * All encode/decode is delegated to libpldm; the PDR wire images are built
++ * here because libpldm ships no numeric-sensor PDR encoder.
++ */
++
++struct pldm_platform_sensor;
++
++/**
++ * @brief Read callback returning the present value of a numeric sensor.
++ *
++ * @param sensor   The sensor being read.
++ * @param reading  Present value (raw, signed 32-bit). The advertised PDR
++ *                 resolution/offset describe how to convert it to a unit.
++ *
++ * @return 0 on success; negative errno to report the sensor as failed.
++ */
++typedef int (*pldm_platform_read_fn)(const struct pldm_platform_sensor *sensor,
++				     int32_t *reading);
++
++/**
++ * @brief Description of a numeric sensor exposed over PLDM Type 2.
++ *
++ * The caller populates one of these (typically as a static const) and passes
++ * it to @ref pldm_platform_add_numeric_sensor. The value is copied into the
++ * module's registry, so the caller's struct need not outlive the call.
++ */
++struct pldm_platform_sensor {
++	uint16_t sensor_id;	    /**< Sensor ID, unique per terminus. */
++	uint16_t entity_type;	    /**< DSP0249 entity type. */
++	uint16_t entity_instance;   /**< Entity instance number. */
++	uint8_t base_unit;	    /**< enum pldm_sensor_units, e.g. degrees C. */
++	int8_t unit_modifier;	    /**< Power-of-ten applied to the reading. */
++	pldm_platform_read_fn read; /**< Live-value callback. */
++};
++
++/**
++ * @brief Install the Type 2 responder into @p ctx.
++ *
++ * Registers the platform handler for PLDM_PLATFORM and announces the type,
++ * its version and command set to the Type 0 (base) responder so the base
++ * discovery commands advertise Type 2. Call after the sensors have been
++ * added, or add sensors afterwards; both orders are supported.
++ *
++ * @return 0 on success, negative errno otherwise.
++ */
++int pldm_platform_responder_register(struct pldm_ctx *ctx);
++
++/**
++ * @brief Register a numeric sensor and its Numeric Sensor PDR.
++ *
++ * @return 0 on success, -ENOSPC if the registry is full, -EINVAL on a bad
++ *         argument.
++ */
++int pldm_platform_add_numeric_sensor(const struct pldm_platform_sensor *sensor);
++
++/**
++ * @brief Override the Terminus ID reported in the Terminus Locator PDR.
++ *
++ * Defaults to the Type 0 TID (@ref pldm_base_get_tid) sampled at register time.
++ */
++void pldm_platform_set_tid(uint8_t tid);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_PLATFORM_H_ */
+diff --git a/subsys/pmci/pldm/CMakeLists.txt b/subsys/pmci/pldm/CMakeLists.txt
+index 8f412d5410b..335254df666 100644
+--- a/subsys/pmci/pldm/CMakeLists.txt
++++ b/subsys/pmci/pldm/CMakeLists.txt
+@@ -4,3 +4,4 @@
+ zephyr_library()
+ zephyr_library_sources(pldm.c)
+ zephyr_library_sources_ifdef(CONFIG_PLDM_TYPE_BASE pldm_base.c)
++zephyr_library_sources_ifdef(CONFIG_PLDM_TYPE_PLATFORM pldm_platform.c)
+diff --git a/subsys/pmci/pldm/Kconfig b/subsys/pmci/pldm/Kconfig
+index 51950363e15..1917578ae3f 100644
+--- a/subsys/pmci/pldm/Kconfig
++++ b/subsys/pmci/pldm/Kconfig
+@@ -72,6 +72,28 @@ config PLDM_BASE_INITIAL_TID
+ 	  Value returned by GetTID before the requester calls SetTID.
+ 	  0x00 and 0xff are reserved by DSP0240 §8.
+ 
++config PLDM_TYPE_PLATFORM
++	bool "PLDM Type 2 (Platform Monitoring and Control, DSP0248)"
++	depends on PLDM_TYPE_BASE
++	select REQUIRES_STD_C11
++	help
++	  Compile the Type 2 responder: GetPDRRepositoryInfo / GetPDR expose a
++	  compile-time PDR repository (a Terminus Locator PDR plus one Numeric
++	  Sensor PDR per registered sensor); GetSensorReading returns live
++	  values; GetStateSensorReadings and PlatformEventMessage are handled
++	  minimally. Requires PLDM_TYPE_BASE so the type is advertised through
++	  the base discovery commands.
++
++config PLDM_PLATFORM_MAX_SENSORS
++	int "Maximum numeric sensors exposed over PLDM Type 2"
++	depends on PLDM_TYPE_PLATFORM
++	default 4
++	range 1 32
++	help
++	  Size of the static sensor registry populated by
++	  pldm_platform_add_numeric_sensor(). One Numeric Sensor PDR is
++	  generated per registered sensor.
++
+ module = PLDM
+ module-str = PLDM
+ source "subsys/logging/Kconfig.template.log_config"
+diff --git a/subsys/pmci/pldm/pldm.c b/subsys/pmci/pldm/pldm.c
+index f3e18f62e3e..8fad0a7d856 100644
+--- a/subsys/pmci/pldm/pldm.c
++++ b/subsys/pmci/pldm/pldm.c
+@@ -133,7 +133,7 @@ int pldm_register_type(struct pldm_ctx *ctx, uint8_t pldm_type,
+ /*
+  * Locate a request slot matching (peer, type, command, instance_id). Called
+  * from the RX path so we know which requester to wake up. Caller holds
+- * ctx->req_lock.
++ * ctx->req_slock.
+  */
+ static struct pldm_request_slot *pldm_find_slot(struct pldm_ctx *ctx,
+ 						mctp_eid_t peer, uint8_t type,
+@@ -157,9 +157,10 @@ static struct pldm_request_slot *pldm_alloc_slot(struct pldm_ctx *ctx,
+ {
+ 	static uint8_t rotor;
+ 	struct pldm_request_slot *s;
++	k_spinlock_key_t key;
+ 
+ 	(void)k_sem_take(&ctx->req_slot_sem, K_FOREVER);
+-	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
++	key = k_spin_lock(&ctx->req_slock);
+ 
+ 	for (size_t i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
+ 		s = &ctx->slots[i];
+@@ -172,22 +173,23 @@ static struct pldm_request_slot *pldm_alloc_slot(struct pldm_ctx *ctx,
+ 			s->resp_len = 0;
+ 			s->rc = 0;
+ 			k_sem_reset(&s->done);
+-			k_mutex_unlock(&ctx->req_lock);
++			k_spin_unlock(&ctx->req_slock, key);
+ 			return s;
+ 		}
+ 	}
+ 
+ 	/* req_slot_sem count and slots[] usage must stay in sync. */
+-	k_mutex_unlock(&ctx->req_lock);
++	k_spin_unlock(&ctx->req_slock, key);
+ 	k_sem_give(&ctx->req_slot_sem);
+ 	return NULL;
+ }
+ 
+ static void pldm_free_slot(struct pldm_ctx *ctx, struct pldm_request_slot *s)
+ {
+-	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
++	k_spinlock_key_t key = k_spin_lock(&ctx->req_slock);
++
+ 	s->used = false;
+-	k_mutex_unlock(&ctx->req_lock);
++	k_spin_unlock(&ctx->req_slock, key);
+ 	k_sem_give(&ctx->req_slot_sem);
+ }
+ 
+@@ -266,14 +268,14 @@ static void pldm_deliver_response(struct pldm_ctx *ctx, mctp_eid_t src,
+ 				  const struct pldm_msg *resp, size_t resp_len)
+ {
+ 	struct pldm_request_slot *slot;
++	k_spinlock_key_t key = k_spin_lock(&ctx->req_slock);
+ 
+-	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
+ 	slot = pldm_find_slot(ctx, src, resp->hdr.type, resp->hdr.command,
+ 			      resp->hdr.instance_id);
+ 	if (slot == NULL) {
+ 		LOG_WRN("orphan response type=%u cmd=%u inst=%u", resp->hdr.type,
+ 			resp->hdr.command, resp->hdr.instance_id);
+-		k_mutex_unlock(&ctx->req_lock);
++		k_spin_unlock(&ctx->req_slock, key);
+ 		return;
+ 	}
+ 
+@@ -284,7 +286,7 @@ static void pldm_deliver_response(struct pldm_ctx *ctx, mctp_eid_t src,
+ 		memcpy(slot->resp_buf, resp, resp_len);
+ 		slot->resp_len = resp_len;
+ 	}
+-	k_mutex_unlock(&ctx->req_lock);
++	k_spin_unlock(&ctx->req_slock, key);
+ 	k_sem_give(&slot->done);
+ }
+ 
+@@ -341,7 +343,6 @@ int pldm_ctx_init(struct pldm_ctx *ctx, struct mctp *mctp, mctp_eid_t eid)
+ 	ctx->local_eid = eid;
+ 
+ #if defined(CONFIG_PLDM_REQUESTER)
+-	k_mutex_init(&ctx->req_lock);
+ 	k_sem_init(&ctx->req_slot_sem, ARRAY_SIZE(ctx->slots),
+ 		   ARRAY_SIZE(ctx->slots));
+ 	for (size_t i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
+diff --git a/subsys/pmci/pldm/pldm_base.c b/subsys/pmci/pldm/pldm_base.c
+index 9fdc3ecf93b..59aa8ce58d8 100644
+--- a/subsys/pmci/pldm/pldm_base.c
++++ b/subsys/pmci/pldm/pldm_base.c
+@@ -33,8 +33,11 @@ LOG_MODULE_DECLARE(pldm, CONFIG_PLDM_LOG_LEVEL);
+  */
+ static uint8_t pldm_base_tid = CONFIG_PLDM_BASE_INITIAL_TID;
+ 
+-/* Only PLDM_BASE (0) is supported so far. Bit N in supported_types[N/8]. */
+-static const bitfield8_t base_supported_types[8] = {
++/*
++ * Bit N in supported_types[N/8] flags PLDM type N. PLDM_BASE (0) is always
++ * present; other types register themselves via pldm_base_register_type().
++ */
++static bitfield8_t base_supported_types[8] = {
+ 	{ .byte = (1U << PLDM_BASE) },
+ 	{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 },
+ };
+@@ -50,6 +53,67 @@ static const ver32_t base_version = {
+ 	.alpha = 0x00,
+ };
+ 
++/*
++ * Registry of additional PLDM types (beyond Type 0) whose version and command
++ * set the base discovery commands should report. Populated by
++ * pldm_base_register_type(); typically one entry (Type 2).
++ */
++#define BASE_MAX_EXTRA_TYPES 4
++
++static struct base_extra_type {
++	bool used;
++	uint8_t type;
++	ver32_t version;
++	bitfield8_t commands[32];
++} base_extra_types[BASE_MAX_EXTRA_TYPES];
++
++static struct base_extra_type *base_find_extra_type(uint8_t type)
++{
++	for (size_t i = 0; i < ARRAY_SIZE(base_extra_types); i++) {
++		if (base_extra_types[i].used &&
++		    base_extra_types[i].type == type) {
++			return &base_extra_types[i];
++		}
++	}
++	return NULL;
++}
++
++int pldm_base_register_type(uint8_t pldm_type, const ver32_t *version,
++			    const bitfield8_t commands[32])
++{
++	struct base_extra_type *slot;
++
++	if (version == NULL || commands == NULL) {
++		return -EINVAL;
++	}
++	if (pldm_type == PLDM_BASE || pldm_type >= PLDM_MAX_TYPES) {
++		return -EINVAL;
++	}
++
++	slot = base_find_extra_type(pldm_type);
++	if (slot == NULL) {
++		for (size_t i = 0; i < ARRAY_SIZE(base_extra_types); i++) {
++			if (!base_extra_types[i].used) {
++				slot = &base_extra_types[i];
++				break;
++			}
++		}
++	}
++	if (slot == NULL) {
++		return -ENOSPC;
++	}
++
++	slot->used = true;
++	slot->type = pldm_type;
++	slot->version = *version;
++	memcpy(slot->commands, commands, sizeof(slot->commands));
++
++	/* Advertise the type in GetPLDMTypes. */
++	base_supported_types[pldm_type / 8].byte |= 1U << (pldm_type % 8);
++
++	return 0;
++}
++
+ uint8_t pldm_base_get_tid(void)
+ {
+ 	return pldm_base_tid;
+@@ -154,12 +218,29 @@ static int handle_get_version(const struct pldm_msg *req, size_t req_len,
+ 	}
+ 
+ 	if (type != PLDM_BASE) {
+-		rc = encode_cc_only_resp(
+-			req->hdr.instance_id, PLDM_BASE, PLDM_GET_PLDM_VERSION,
+-			PLDM_GET_PLDM_VERSION_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
+-			resp);
+-		*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
+-		return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++		struct base_extra_type *extra = base_find_extra_type(type);
++
++		if (extra == NULL) {
++			rc = encode_cc_only_resp(
++				req->hdr.instance_id, PLDM_BASE,
++				PLDM_GET_PLDM_VERSION,
++				PLDM_GET_PLDM_VERSION_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
++				resp);
++			*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++			return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++		}
++
++		rc = encode_get_version_resp(req->hdr.instance_id, PLDM_SUCCESS,
++					     0 /* next handle */,
++					     PLDM_START_AND_END,
++					     &extra->version,
++					     sizeof(extra->version), resp);
++		if (rc != PLDM_SUCCESS) {
++			return -EIO;
++		}
++		*resp_len = sizeof(struct pldm_msg_hdr) +
++			    PLDM_GET_VERSION_RESP_BYTES;
++		return 0;
+ 	}
+ 
+ 	rc = encode_get_version_resp(req->hdr.instance_id, PLDM_SUCCESS,
+@@ -216,12 +297,26 @@ static int handle_get_commands(const struct pldm_msg *req, size_t req_len,
+ 		return -EBADMSG;
+ 	}
+ 	if (type != PLDM_BASE) {
+-		rc = encode_cc_only_resp(
+-			req->hdr.instance_id, PLDM_BASE, PLDM_GET_PLDM_COMMANDS,
+-			PLDM_GET_PLDM_COMMANDS_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
+-			resp);
+-		*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
+-		return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++		struct base_extra_type *extra = base_find_extra_type(type);
++
++		if (extra == NULL) {
++			rc = encode_cc_only_resp(
++				req->hdr.instance_id, PLDM_BASE,
++				PLDM_GET_PLDM_COMMANDS,
++				PLDM_GET_PLDM_COMMANDS_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
++				resp);
++			*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++			return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++		}
++
++		rc = encode_get_commands_resp(req->hdr.instance_id, PLDM_SUCCESS,
++					      extra->commands, resp);
++		if (rc != PLDM_SUCCESS) {
++			return -EIO;
++		}
++		*resp_len = sizeof(struct pldm_msg_hdr) +
++			    PLDM_GET_COMMANDS_RESP_BYTES;
++		return 0;
+ 	}
+ 
+ 	base_cmds_populate();
+diff --git a/subsys/pmci/pldm/pldm_platform.c b/subsys/pmci/pldm/pldm_platform.c
+new file mode 100644
+index 00000000000..1a6e0b2abee
+--- /dev/null
++++ b/subsys/pmci/pldm/pldm_platform.c
+@@ -0,0 +1,564 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM Type 2 (Platform Monitoring and Control, DSP0248) responder.
++ *
++ * Exposes a compile-time PDR repository (one Terminus Locator PDR plus one
++ * Numeric Sensor PDR per registered sensor) so a management controller can
++ * discover the terminus with GetPDRRepositoryInfo / GetPDR and then poll
++ * live readings with GetSensorReading. GetStateSensorReadings and
++ * PlatformEventMessage are handled at a minimal level.
++ *
++ * libpldm supplies all request decode / response encode. It ships no numeric
++ * sensor PDR encoder, so the PDR wire images are assembled here byte for byte
++ * to match decode_numeric_sensor_pdr_data() (DSP0248 Table 78). All targets
++ * are little-endian, matching the PLDM wire order, so real32 fields are
++ * copied verbatim.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/sys/byteorder.h>
++#include <zephyr/logging/log.h>
++
++#include <libpldm/base.h>
++#include <libpldm/platform.h>
++#include <libpldm/pldm_types.h>
++
++#include <zephyr/pmci/pldm/pldm.h>
++#include <zephyr/pmci/pldm/pldm_base.h>
++#include <zephyr/pmci/pldm/pldm_platform.h>
++
++LOG_MODULE_DECLARE(pldm, CONFIG_PLDM_LOG_LEVEL);
++
++/* DSP0248 v1.2.0 for the platform type (BCD-encoded ver32). */
++static const ver32_t platform_version = {
++	.major = 0xf1,	/* 1 */
++	.minor = 0xf2,	/* .2 */
++	.update = 0xf0, /* .0 */
++	.alpha = 0x00,
++};
++
++/* Common PDR header version (DSP0248 §28.1). */
++#define PLDM_PDR_HEADER_VERSION 0x01
++
++/* Sensor reading is transmitted as a signed 32-bit value. */
++#define SENSOR_READING_DATA_SIZE PLDM_SENSOR_DATA_SIZE_SINT32
++#define RANGE_FIELD_FORMAT	 PLDM_RANGE_FIELD_FORMAT_SINT32
++
++/* Largest PDR wire image we assemble (numeric sensor PDR with SINT32 fields). */
++#define PDR_RECORD_MAX 128
++
++static struct pldm_platform_sensor sensors[CONFIG_PLDM_PLATFORM_MAX_SENSORS];
++static uint8_t sensor_count;
++static uint8_t platform_tid;
++static mctp_eid_t platform_eid;
++
++/* Record handle 1 is the terminus locator; sensors start at handle 2. */
++#define TERMINUS_LOCATOR_HANDLE 1U
++#define FIRST_SENSOR_HANDLE	2U
++
++void pldm_platform_set_tid(uint8_t tid)
++{
++	platform_tid = tid;
++}
++
++int pldm_platform_add_numeric_sensor(const struct pldm_platform_sensor *sensor)
++{
++	if (sensor == NULL || sensor->read == NULL) {
++		return -EINVAL;
++	}
++	if (sensor_count >= ARRAY_SIZE(sensors)) {
++		return -ENOSPC;
++	}
++	sensors[sensor_count] = *sensor;
++	sensor_count++;
++	return 0;
++}
++
++static struct pldm_platform_sensor *sensor_by_id(uint16_t id)
++{
++	for (uint8_t i = 0; i < sensor_count; i++) {
++		if (sensors[i].sensor_id == id) {
++			return &sensors[i];
++		}
++	}
++	return NULL;
++}
++
++/* Little-endian float32 write (wire order == host order on LE targets). */
++static inline void put_real32(uint8_t *buf, float val)
++{
++	memcpy(buf, &val, sizeof(val));
++}
++
++/*
++ * Assemble the Terminus Locator PDR (record handle 1) into @p buf.
++ * Returns the record length; buf must hold at least 19 bytes.
++ */
++static size_t build_terminus_locator_pdr(uint8_t *buf)
++{
++	size_t o = 0;
++
++	/* pldm_pdr_hdr */
++	sys_put_le32(TERMINUS_LOCATOR_HANDLE, &buf[o]);
++	o += 4;
++	buf[o++] = PLDM_PDR_HEADER_VERSION;
++	buf[o++] = PLDM_TERMINUS_LOCATOR_PDR;
++	sys_put_le16(0, &buf[o]); /* record_change_num */
++	o += 2;
++	size_t len_off = o;
++	o += 2; /* length filled in below */
++
++	size_t body = o;
++	sys_put_le16(0, &buf[o]); /* terminus_handle */
++	o += 2;
++	buf[o++] = PLDM_TL_PDR_VALID;
++	buf[o++] = platform_tid;
++	sys_put_le16(PLDM_PLATFORM_ENTITY_SYSTEM_CONTAINER_ID, &buf[o]);
++	o += 2;
++	buf[o++] = PLDM_TERMINUS_LOCATOR_TYPE_MCTP_EID;
++	buf[o++] = 1U;			 /* terminus_locator_value_size */
++	buf[o++] = (uint8_t)platform_eid; /* MCTP EID locator value */
++
++	sys_put_le16((uint16_t)(o - body), &buf[len_off]);
++	return o;
++}
++
++/*
++ * Assemble the Numeric Sensor PDR for @p s into @p buf. Returns the record
++ * length. Uses SINT32 sensor-data and range-field formats, matching
++ * SENSOR_READING_DATA_SIZE / RANGE_FIELD_FORMAT, so decode_numeric_sensor_
++ * pdr_data() reads it back exactly.
++ */
++static size_t build_numeric_sensor_pdr(const struct pldm_platform_sensor *s,
++				       uint32_t handle, uint8_t *buf)
++{
++	size_t o = 0;
++
++	/* pldm_pdr_hdr */
++	sys_put_le32(handle, &buf[o]);
++	o += 4;
++	buf[o++] = PLDM_PDR_HEADER_VERSION;
++	buf[o++] = PLDM_NUMERIC_SENSOR_PDR;
++	sys_put_le16(0, &buf[o]); /* record_change_num */
++	o += 2;
++	size_t len_off = o;
++	o += 2; /* length filled in below */
++
++	size_t body = o;
++	sys_put_le16(0, &buf[o]); /* terminus_handle */
++	o += 2;
++	sys_put_le16(s->sensor_id, &buf[o]);
++	o += 2;
++	sys_put_le16(s->entity_type, &buf[o]);
++	o += 2;
++	sys_put_le16(s->entity_instance, &buf[o]);
++	o += 2;
++	sys_put_le16(PLDM_PLATFORM_ENTITY_SYSTEM_CONTAINER_ID, &buf[o]);
++	o += 2;
++	buf[o++] = 0;			 /* sensor_init: noInit */
++	buf[o++] = 0;			 /* sensor_auxiliary_names_pdr: false */
++	buf[o++] = s->base_unit;	 /* base_unit */
++	buf[o++] = (uint8_t)s->unit_modifier;
++	buf[o++] = 0; /* rate_unit: none */
++	buf[o++] = 0; /* base_oem_unit_handle */
++	buf[o++] = 0; /* aux_unit: none */
++	buf[o++] = 0; /* aux_unit_modifier */
++	buf[o++] = 0; /* aux_rate_unit */
++	buf[o++] = 0; /* rel */
++	buf[o++] = 0; /* aux_oem_unit_handle */
++	buf[o++] = 1; /* is_linear: true */
++	buf[o++] = SENSOR_READING_DATA_SIZE;
++	put_real32(&buf[o], 1.0f); /* resolution */
++	o += 4;
++	put_real32(&buf[o], 0.0f); /* offset */
++	o += 4;
++	sys_put_le16(0, &buf[o]); /* accuracy */
++	o += 2;
++	buf[o++] = 0;		    /* plus_tolerance */
++	buf[o++] = 0;		    /* minus_tolerance */
++	sys_put_le32(0, &buf[o]); /* hysteresis (SINT32) */
++	o += 4;
++	buf[o++] = 0;		    /* supported_thresholds */
++	buf[o++] = 0;		    /* threshold_and_hysteresis_volatility */
++	put_real32(&buf[o], 0.0f); /* state_transition_interval */
++	o += 4;
++	put_real32(&buf[o], 1.0f); /* update_interval */
++	o += 4;
++	sys_put_le32((uint32_t)125, &buf[o]); /* max_readable */
++	o += 4;
++	sys_put_le32((uint32_t)(-40), &buf[o]); /* min_readable */
++	o += 4;
++	buf[o++] = RANGE_FIELD_FORMAT;
++	buf[o++] = 0; /* range_field_support */
++	for (int i = 0; i < 9; i++) {
++		/* nominal, normal max/min, warning, critical, fatal (SINT32). */
++		sys_put_le32(0, &buf[o]);
++		o += 4;
++	}
++
++	sys_put_le16((uint16_t)(o - body), &buf[len_off]);
++	return o;
++}
++
++/*
++ * Materialise the PDR identified by @p handle. Returns the record length via
++ * @p out_len and the next record handle (0 == last) via @p next. Returns
++ * -ENOENT if the handle is out of range.
++ */
++static int build_pdr(uint32_t handle, uint8_t *buf, size_t *out_len,
++		     uint32_t *next)
++{
++	if (handle == TERMINUS_LOCATOR_HANDLE) {
++		*out_len = build_terminus_locator_pdr(buf);
++		*next = (sensor_count > 0) ? FIRST_SENSOR_HANDLE : 0;
++		return 0;
++	}
++
++	if (handle >= FIRST_SENSOR_HANDLE &&
++	    handle < FIRST_SENSOR_HANDLE + sensor_count) {
++		uint8_t idx = (uint8_t)(handle - FIRST_SENSOR_HANDLE);
++
++		*out_len = build_numeric_sensor_pdr(&sensors[idx], handle, buf);
++		*next = (idx + 1 < sensor_count) ? handle + 1 : 0;
++		return 0;
++	}
++
++	return -ENOENT;
++}
++
++static size_t total_repository_size(uint32_t *record_count, uint32_t *largest)
++{
++	uint8_t buf[PDR_RECORD_MAX];
++	size_t total = 0;
++	size_t len;
++	uint32_t next;
++
++	*record_count = 0;
++	*largest = 0;
++
++	for (uint32_t h = TERMINUS_LOCATOR_HANDLE;
++	     build_pdr(h, buf, &len, &next) == 0; h = next) {
++		total += len;
++		(*record_count)++;
++		if (len > *largest) {
++			*largest = (uint32_t)len;
++		}
++		if (next == 0) {
++			break;
++		}
++	}
++	return total;
++}
++
++static int cc_only(uint8_t iid, uint8_t command, uint8_t cc,
++		   struct pldm_msg *resp, size_t resp_size, size_t *resp_len)
++{
++	if (resp_size < sizeof(struct pldm_msg_hdr) + 1U) {
++		return -ENOSPC;
++	}
++	if (encode_cc_only_resp(iid, PLDM_PLATFORM, command, cc, resp) !=
++	    PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++	return 0;
++}
++
++static int handle_get_pdr_repository_info(const struct pldm_msg *req,
++					  struct pldm_msg *resp,
++					  size_t resp_size, size_t *resp_len)
++{
++	uint32_t record_count;
++	uint32_t largest;
++	uint32_t size;
++	int rc;
++
++	if (resp_size < sizeof(struct pldm_msg_hdr) +
++				PLDM_GET_PDR_REPOSITORY_INFO_RESP_BYTES) {
++		return -ENOSPC;
++	}
++
++	size = (uint32_t)total_repository_size(&record_count, &largest);
++
++	rc = encode_get_pdr_repository_info_resp(
++		req->hdr.instance_id, PLDM_SUCCESS, PLDM_AVAILABLE, NULL, NULL,
++		record_count, size, largest, PLDM_NO_TIMEOUT, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) +
++		    PLDM_GET_PDR_REPOSITORY_INFO_RESP_BYTES;
++	return 0;
++}
++
++static int handle_get_pdr(const struct pldm_msg *req, size_t req_len,
++			  struct pldm_msg *resp, size_t resp_size,
++			  size_t *resp_len)
++{
++	uint8_t record[PDR_RECORD_MAX];
++	uint32_t record_hndl;
++	uint32_t data_xfer_hndl;
++	uint8_t op_flag;
++	uint16_t request_cnt;
++	uint16_t record_chg_num;
++	size_t record_len;
++	uint32_t next;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) + PLDM_GET_PDR_REQ_BYTES) {
++		return -EBADMSG;
++	}
++
++	rc = decode_get_pdr_req(req, req_len - sizeof(struct pldm_msg_hdr),
++				&record_hndl, &data_xfer_hndl, &op_flag,
++				&request_cnt, &record_chg_num);
++	if (rc != PLDM_SUCCESS) {
++		return -EBADMSG;
++	}
++
++	/* recordHandle 0 selects the first PDR (DSP0248 §21.3). */
++	if (record_hndl == 0) {
++		record_hndl = TERMINUS_LOCATOR_HANDLE;
++	}
++
++	rc = build_pdr(record_hndl, record, &record_len, &next);
++	if (rc != 0) {
++		return cc_only(req->hdr.instance_id, PLDM_GET_PDR,
++			       PLDM_PLATFORM_INVALID_RECORD_HANDLE, resp,
++			       resp_size, resp_len);
++	}
++
++	/* Single-part transfer: the whole record is returned at once. */
++	if (resp_size < sizeof(struct pldm_msg_hdr) +
++				(sizeof(struct pldm_get_pdr_resp) - 1) +
++				record_len) {
++		return -ENOSPC;
++	}
++
++	rc = encode_get_pdr_resp(req->hdr.instance_id, PLDM_SUCCESS, next,
++				 0 /* next data transfer handle */,
++				 PLDM_START_AND_END, (uint16_t)record_len,
++				 record, 0 /* transfer crc */, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) +
++		    (sizeof(struct pldm_get_pdr_resp) - 1) + record_len;
++	return 0;
++}
++
++static int handle_get_sensor_reading(const struct pldm_msg *req, size_t req_len,
++				     struct pldm_msg *resp, size_t resp_size,
++				     size_t *resp_len)
++{
++	struct pldm_platform_sensor *s;
++	uint16_t sensor_id;
++	bool8_t rearm;
++	int32_t reading = 0;
++	uint8_t op_state = PLDM_SENSOR_ENABLED;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) +
++			      PLDM_GET_SENSOR_READING_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) +
++				PLDM_GET_SENSOR_READING_MIN_RESP_BYTES + 3U) {
++		return -ENOSPC;
++	}
++
++	rc = decode_get_sensor_reading_req(
++		req, req_len - sizeof(struct pldm_msg_hdr), &sensor_id, &rearm);
++	if (rc != PLDM_SUCCESS) {
++		return -EBADMSG;
++	}
++
++	s = sensor_by_id(sensor_id);
++	if (s == NULL) {
++		return cc_only(req->hdr.instance_id, PLDM_GET_SENSOR_READING,
++			       PLDM_PLATFORM_INVALID_SENSOR_ID, resp, resp_size,
++			       resp_len);
++	}
++
++	if (s->read(s, &reading) != 0) {
++		op_state = PLDM_SENSOR_FAILED;
++		reading = 0;
++	}
++
++	rc = encode_get_sensor_reading_resp(
++		req->hdr.instance_id, PLDM_SUCCESS, SENSOR_READING_DATA_SIZE,
++		op_state, PLDM_NO_EVENT_GENERATION, PLDM_SENSOR_NORMAL,
++		PLDM_SENSOR_NORMAL, PLDM_SENSOR_NORMAL,
++		(const uint8_t *)&reading, resp,
++		PLDM_GET_SENSOR_READING_MIN_RESP_BYTES + 3U);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) +
++		    PLDM_GET_SENSOR_READING_MIN_RESP_BYTES + 3U;
++	return 0;
++}
++
++static int handle_get_state_sensor_readings(const struct pldm_msg *req,
++					    size_t req_len,
++					    struct pldm_msg *resp,
++					    size_t resp_size, size_t *resp_len)
++{
++	get_sensor_state_field field = {
++		.sensor_op_state = PLDM_SENSOR_ENABLED,
++		.present_state = PLDM_SENSOR_NORMAL,
++		.previous_state = PLDM_SENSOR_NORMAL,
++		.event_state = PLDM_SENSOR_NORMAL,
++	};
++	uint16_t sensor_id;
++	bitfield8_t rearm;
++	uint8_t reserved;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) +
++			      PLDM_GET_STATE_SENSOR_READINGS_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) +
++				PLDM_GET_STATE_SENSOR_READINGS_MIN_RESP_BYTES +
++				sizeof(get_sensor_state_field)) {
++		return -ENOSPC;
++	}
++
++	rc = decode_get_state_sensor_readings_req(
++		req, req_len - sizeof(struct pldm_msg_hdr), &sensor_id, &rearm,
++		&reserved);
++	if (rc != PLDM_SUCCESS) {
++		return -EBADMSG;
++	}
++
++	if (sensor_by_id(sensor_id) == NULL) {
++		return cc_only(req->hdr.instance_id,
++			       PLDM_GET_STATE_SENSOR_READINGS,
++			       PLDM_PLATFORM_INVALID_SENSOR_ID, resp, resp_size,
++			       resp_len);
++	}
++
++	rc = encode_get_state_sensor_readings_resp(req->hdr.instance_id,
++						   PLDM_SUCCESS, 1, &field, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) +
++		    PLDM_GET_STATE_SENSOR_READINGS_MIN_RESP_BYTES +
++		    sizeof(get_sensor_state_field);
++	return 0;
++}
++
++static int handle_platform_event_message(const struct pldm_msg *req,
++					 size_t req_len, struct pldm_msg *resp,
++					 size_t resp_size, size_t *resp_len)
++{
++	uint8_t format_version;
++	uint8_t tid;
++	uint8_t event_class;
++	size_t event_data_offset;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) +
++			      PLDM_PLATFORM_EVENT_MESSAGE_MIN_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) +
++				PLDM_PLATFORM_EVENT_MESSAGE_RESP_BYTES) {
++		return -ENOSPC;
++	}
++
++	rc = decode_platform_event_message_req(
++		req, req_len - sizeof(struct pldm_msg_hdr), &format_version,
++		&tid, &event_class, &event_data_offset);
++	if (rc != PLDM_SUCCESS) {
++		return -EBADMSG;
++	}
++
++	LOG_INF("PlatformEventMessage from TID %u class 0x%02x accepted", tid,
++		event_class);
++
++	rc = encode_platform_event_message_resp(req->hdr.instance_id,
++						PLDM_SUCCESS,
++						PLDM_EVENT_NO_LOGGING, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) +
++		    PLDM_PLATFORM_EVENT_MESSAGE_RESP_BYTES;
++	return 0;
++}
++
++static int pldm_platform_handler(struct pldm_ctx *ctx, uint8_t src_eid,
++				 const struct pldm_msg *req, size_t req_len,
++				 struct pldm_msg *resp, size_t resp_size,
++				 size_t *resp_len)
++{
++	ARG_UNUSED(ctx);
++	ARG_UNUSED(src_eid);
++
++	switch (req->hdr.command) {
++	case PLDM_GET_PDR_REPOSITORY_INFO:
++		return handle_get_pdr_repository_info(req, resp, resp_size,
++						      resp_len);
++	case PLDM_GET_PDR:
++		return handle_get_pdr(req, req_len, resp, resp_size, resp_len);
++	case PLDM_GET_SENSOR_READING:
++		return handle_get_sensor_reading(req, req_len, resp, resp_size,
++						 resp_len);
++	case PLDM_GET_STATE_SENSOR_READINGS:
++		return handle_get_state_sensor_readings(req, req_len, resp,
++							resp_size, resp_len);
++	case PLDM_PLATFORM_EVENT_MESSAGE:
++		return handle_platform_event_message(req, req_len, resp,
++						     resp_size, resp_len);
++	default:
++		return cc_only(req->hdr.instance_id, req->hdr.command,
++			       PLDM_ERROR_UNSUPPORTED_PLDM_CMD, resp, resp_size,
++			       resp_len);
++	}
++}
++
++int pldm_platform_responder_register(struct pldm_ctx *ctx)
++{
++#if defined(CONFIG_PLDM_RESPONDER)
++	bitfield8_t commands[32] = { 0 };
++	int rc;
++
++	if (ctx == NULL) {
++		return -EINVAL;
++	}
++
++	/* Default the terminus locator TID to the Type 0 value. */
++	platform_tid = pldm_base_get_tid();
++	platform_eid = ctx->local_eid;
++
++	/* Byte N of the command bitmap covers commands [N*8 .. N*8+7]. */
++	commands[PLDM_PLATFORM_EVENT_MESSAGE / 8].byte |=
++		1U << (PLDM_PLATFORM_EVENT_MESSAGE % 8);
++	commands[PLDM_GET_SENSOR_READING / 8].byte |=
++		1U << (PLDM_GET_SENSOR_READING % 8);
++	commands[PLDM_GET_STATE_SENSOR_READINGS / 8].byte |=
++		1U << (PLDM_GET_STATE_SENSOR_READINGS % 8);
++	commands[PLDM_GET_PDR_REPOSITORY_INFO / 8].byte |=
++		1U << (PLDM_GET_PDR_REPOSITORY_INFO % 8);
++	commands[PLDM_GET_PDR / 8].byte |= 1U << (PLDM_GET_PDR % 8);
++
++	rc = pldm_base_register_type(PLDM_PLATFORM, &platform_version, commands);
++	if (rc != 0) {
++		return rc;
++	}
++
++	return pldm_register_type(ctx, PLDM_PLATFORM, pldm_platform_handler);
++#else
++	ARG_UNUSED(ctx);
++	return -ENOSYS;
++#endif
++}

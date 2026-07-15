@@ -2,53 +2,485 @@
 
 ## Description
 
-The Hardware Fault Management China sub-project will align its objectives
-with the global project, with the core goal of jointly addressing key pain
-points in hardware fault management for large-scale data centers.
+The Hardware Fault Management China sub-project aligns with the global
+project's core goal of jointly addressing key pain points in hardware
+fault management for large-scale data centers. Alignment covers three
+areas: technical objectives, resource coordination, and targeted problem
+solving.
 
-Specifically, this alignment manifests in three aspects:
-Technical Objective Alignment Resource Coordination Targeted Problem Solving
+The tree contains four moving pieces that we build and validate
+together:
 
-## Requirements
+1. **QEMU 11.x** built from source (needed for I3C support and modern
+   AST2600/RISC-V virt features).
+2. **Zephyr on RISC-V** — booting the Zephyr `qemu_riscv64` (aka
+   `virt`) target with the QEMU we just built.
+3. **I3C on QEMU virt + Zephyr** — DesignWare I3C controller support
+   plumbed all the way from the QEMU device model to the Zephyr driver.
+4. **MCTP + PLDM (the HFM stack)** — DMTF PMCI transport bindings
+   (I3C / I2C / serial) and PLDM Type 0 (discovery) + Type 2 (platform
+   monitoring) on both Zephyr and OpenBMC, bridged between two live QEMU
+   instances over an MCTP-serial link. This is where Hardware Fault
+   Management telemetry actually flows; see [Part 4](#part-4--mctp--pldm-the-hardware-fault-management-stack).
 
-The build was validated on Ubuntu 24.04. The dependency list below still
-works on Ubuntu 22.04, but on 20.04 several packages have different names
-(`libmagic1t64` -> `libmagic1`, `gcc-13-riscv64-linux-gnu` is not packaged,
-etc.) so 22.04+ is recommended.
+An OpenBMC AST2600 recipe is also documented at the end for reference.
 
-Root privileges are required for the OpenBMC build (bitbake needs to write
-`/proc/self/uid_map` inside a user namespace during `do_unpack`). If your
-environment mounts `/proc` read-only even for root (some container
-sandboxes), see `patches/openbmc-bitbake-disable_network-erofs.patch`.
+Root privileges are required for the OpenBMC build (bitbake needs to
+write `/proc/self/uid_map` inside a user namespace during `do_unpack`).
+If your environment mounts `/proc` read-only even for root (some
+container sandboxes), see
+`patches/openbmc-bitbake-disable_network-erofs.patch`.
+
+The build was validated on Ubuntu 24.04. The dependency list below
+still works on Ubuntu 22.04, but on 20.04 several packages have
+different names (`libmagic1t64` -> `libmagic1`, `gcc-13-riscv64-linux-gnu`
+is not packaged, etc.) so 22.04+ is recommended.
 
 ```shell
 sudo apt update
-
-# Install qemu-system-riscv64 and qemu-system-aarch64
-sudo apt install -y qemu-system-riscv64 qemu-system-aarch64
-
-# Install build dependencies and download tools
 sudo apt install --no-install-recommends -y python3 python3-pip \
-		 python3-setuptools python3-wheel python3-pykwalify python3-venv \
-		 cmake ninja-build gperf ccache device-tree-compiler libsdl2-dev \
-		 libmagic1t64 dfu-util python3-tk xz-utils file make gcc \
-		 patool git build-essential libsdl1.2-dev \
-		 chrpath diffstat locales cpio python3-dev \
-		 python3-pexpect debianutils iputils-ping python3-git \
-		 python3-jinja2 python3-subunit gcc-13-riscv64-linux-gnu \
-		 mesa-common-dev zstd liblz4-tool libncurses5-dev flex \
-		 gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu wget \
-		 bison texinfo gawk
-
+     python3-setuptools python3-wheel python3-pykwalify python3-venv \
+     cmake ninja-build gperf ccache device-tree-compiler libsdl2-dev \
+     libmagic1t64 dfu-util python3-tk xz-utils file make gcc \
+     patool git build-essential libsdl1.2-dev \
+     chrpath diffstat locales cpio python3-dev \
+     python3-pexpect debianutils iputils-ping python3-git \
+     python3-jinja2 python3-subunit gcc-13-riscv64-linux-gnu \
+     mesa-common-dev zstd liblz4-tool libncurses5-dev flex \
+     gcc-riscv64-linux-gnu binutils-riscv64-linux-gnu wget \
+     bison texinfo gawk
 pip install patool semver tqdm pyelftools --break-system-packages
 ```
 
-# Usage
+---
 
-## OpenBMC QEMU instance
+## Upstream sources & versions
 
-Please use user name 'root' and password '0penBmc'
-(its zero not captialized o) to login in OpenBMC and webUI
+This repo does **not** vendor full copies of the three upstream trees.
+Each is pinned to a public release below; every change this project
+makes to them ships as a patch under
+[patches/](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches)
+(see [patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md)
+for the full index and apply order). Clone the upstream at the pinned
+ref, apply the patches, and you reproduce the exact tree used here.
+
+| Tree | Pinned version | Get it | Local changes (patches) |
+|---|---|---|---|
+| QEMU | 11.0.0 (release tarball) | `https://download.qemu.org/qemu-11.0.0.tar.xz` | `qemu-riscv-virt-allow-dw-i3c.patch` |
+| Zephyr | tag `v4.3.0` | `west init --mr v4.3.0` → `https://github.com/zephyrproject-rtos/zephyr` | `0001`,`0002`,`0003`,`0005`,`0007`,`0008` |
+| libpldm (Zephyr module) | SHA `df0a2219` | `https://github.com/openbmc/libpldm` (pinned in `west.yml` by patch 0002) | — (vendored via west manifest) |
+| OpenBMC | tag `2.18.0` | `https://github.com/openbmc/openbmc` | `0004`,`0006`, `openbmc-bitbake-disable_network-erofs.patch` |
+
+The Zephyr SDK used is 0.17.4 (RISC-V toolchain only). Because the deltas
+are small and the bases are public, pinning + patches is preferred over
+committing multi-GB source trees.
+
+---
+
+## Part 1 — QEMU: version and build
+
+### Why we build QEMU from source
+
+| Source                       | Version          | I3C support | AST2600 completeness |
+|------------------------------|------------------|-------------|----------------------|
+| Ubuntu 20.04 `qemu-system-*` | 4.2.1            | no          | partial              |
+| Ubuntu 22.04 `qemu-system-*` | 6.2              | no          | partial              |
+| Ubuntu 24.04 `qemu-system-*` | 8.2              | Aspeed only | good                 |
+| Upstream release (2026-07)   | **11.0.2**       | **full**    | full                 |
+| This tree                    | **11.0.0** local | full + patch| full                 |
+
+Since QEMU switched to a date-based `major.minor.micro` scheme starting
+with 3.0, "11.0.x" is simply the current stable series (2025-Q4 →
+2026-Q2). The Hardware Fault Management flow needs I3C, dynamic sysbus
+devices on `virt`, and the AST2600 SoC additions that only landed
+upstream — so we build 11.x locally instead of relying on distro
+packages.
+
+### Build QEMU 11 from source
+
+Source location on this machine:
+[/data00/home/terry.gong/qemu-11-src](file:///data00/home/terry.gong/qemu-11-src)
+(release tarball extracted from `https://download.qemu.org/`).
+
+QEMU 11 depends on **glib >= 2.66** (uses `g_uri_parse_params`). Ubuntu
+20.04 ships glib 2.64, so we install a newer glib into `$HOME/local`
+first and point QEMU at it via `LD_LIBRARY_PATH`.
+
+```shell
+# 1. Build glib >= 2.66 into $HOME/local (only needed on Ubuntu 20.04)
+GLIB_VER=2.78.6
+wget https://download.gnome.org/sources/glib/2.78/glib-${GLIB_VER}.tar.xz
+tar xf glib-${GLIB_VER}.tar.xz && cd glib-${GLIB_VER}
+meson setup _build --prefix=$HOME/local -Dtests=false
+ninja -C _build install
+cd ..
+
+# 2. Configure and build QEMU 11 for the targets we need
+cd /data00/home/terry.gong/qemu-11-src
+python3 -m venv pyvenv
+./pyvenv/bin/pip install meson==1.10.0 ninja
+mkdir -p build && cd build
+
+PKG_CONFIG_PATH=$HOME/local/lib/x86_64-linux-gnu/pkgconfig \
+LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu \
+../pyvenv/bin/meson setup .. \
+    --prefix=$HOME/qemu-build \
+    --target-list=riscv64-softmmu,arm-softmmu,aarch64-softmmu \
+    -Ddocs=disabled -Dgtk=disabled -Dsdl=disabled
+
+ninja
+ninja install
+```
+
+Result: `$HOME/qemu-build/bin/qemu-system-{riscv64,arm,aarch64}` (each
+about 85 MB).
+
+### The `qemu11.sh` wrapper
+
+Because the local glib lives outside the loader path, direct invocation
+of the freshly built binary aborts with
+`undefined symbol: g_uri_parse_params`. Use the wrapper at
+[scripts/qemu11.sh](file:///home/terry.gong/workspace/Hardware-Fault-Management/scripts/qemu11.sh)
+instead of calling `qemu-system-*` directly:
+
+```shell
+scripts/qemu11.sh riscv64 -machine virt -nographic ...
+scripts/qemu11.sh arm     -machine ast2600-evb ...
+```
+
+The wrapper sets `LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu`
+before `exec`ing the requested `qemu-system-<target>` so any script or
+manual command line stays portable.
+
+The `launch_hfm.sh` and `launch_openbmc.sh` scripts under `scripts/`
+already prefer `$HOME/qemu-build/bin` and fall back to the distro
+binary if the local install is missing.
+
+---
+
+## Part 2 — RISC-V Zephyr on QEMU virt
+
+### Board choice: `qemu_riscv64` (a.k.a. QEMU `virt`)
+
+Zephyr ships a first-class board named `qemu_riscv64` that targets
+QEMU's `-machine virt` RISC-V board (the SoC-agnostic reference
+platform). It is far friendlier than `hifive_unmatched` for emulation:
+
+- `virt` is upstream QEMU's own board, so DTS/PLIC/CLINT/UART all match.
+- No PLL_LOCK busy loops, no L2 LIM SRAM at fictitious addresses.
+- Supports platform bus + dynamic sysbus devices — exactly what we
+  need to plug an I3C controller in later (Part 3).
+
+Board metadata:
+[boards/qemu/riscv64/qemu_riscv64.yaml](file:///data00/home/terry.gong/zephyrproject/zephyr/boards/qemu/riscv64/qemu_riscv64.yaml).
+
+### Build Zephyr for `qemu_riscv64` and boot it
+
+```shell
+export ZEPHYR_DIR=$HOME/zephyrproject
+
+# west + venv (skip if already provisioned)
+python3 -m venv $ZEPHYR_DIR/.venv
+source $ZEPHYR_DIR/.venv/bin/activate
+pip install west --break-system-packages || true
+
+west init --mr v4.3.0 $ZEPHYR_DIR
+cd $ZEPHYR_DIR
+west update
+west zephyr-export
+cd zephyr
+west sdk install
+
+# Build the hello_world sample for qemu_riscv64
+west build -d build-qriscv -b qemu_riscv64 -p always samples/hello_world
+```
+
+Boot the resulting ELF with the QEMU 11 wrapper (unlike
+`hifive_unmatched`, `west build -t run` also works because
+`qemu_riscv64` lists qemu as its runner):
+
+```shell
+$HOME/workspace/Hardware-Fault-Management/scripts/qemu11.sh riscv64 \
+    -machine virt -smp 1 -nographic -m 256 -bios none \
+    -kernel build-qriscv/zephyr/zephyr.elf \
+    -serial mon:stdio
+```
+
+Expected output:
+
+```
+*** Booting Zephyr OS build v4.3.0 ***
+Hello World! qemu_riscv64/qemu_virt_riscv64
+```
+
+### Legacy: hifive_unmatched (`sifive_u` machine)
+
+The prebuilt HFM ELF `prebuilts/zephyr.elf` targets
+`hifive_unmatched/fu740/u74` and is preserved for backwards
+compatibility. Two patches are required to boot it under QEMU 11
+because `sifive_u` is a partial FU540/FU740 model:
+
+- [patches/zephyr-fu700-pll-lock-qemu-timeout.patch](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/zephyr-fu700-pll-lock-qemu-timeout.patch)
+  — bounds `soc_early_init_hook`'s wait for PLL_LOCK (QEMU's
+  `sifive_u_prci` never asserts it).
+- [patches/zephyr-qemu-hifive.overlay](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/zephyr-qemu-hifive.overlay)
+  — redirects `zephyr,sram` to DDR and shrinks `ram0` so heap init
+  does not fault above `-m 256`.
+
+```shell
+patch -p1 -d zephyr < ../../patches/zephyr-fu700-pll-lock-qemu-timeout.patch
+west build -b hifive_unmatched/fu740/u74 -p always samples/hello_world/ \
+    -- -DDTC_OVERLAY_FILE=$(pwd)/../../patches/zephyr-qemu-hifive.overlay
+
+scripts/qemu11.sh riscv64 \
+    -machine sifive_u -smp 5 -nographic -m 256 -bios none \
+    -kernel build/zephyr/zephyr.elf -serial mon:stdio
+```
+
+**New work should target `qemu_riscv64`** unless FU740-specific
+peripherals are required.
+
+---
+
+## Part 3 — I3C: source, patches, and how to build
+
+### Where the source comes from
+
+**QEMU side** — DesignWare I3C controller model, in-tree since QEMU
+11.x under [hw/i3c/](file:///data00/home/terry.gong/qemu-11-src/hw/i3c):
+
+| File                                                                                                                    | Role                                            |
+|-------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
+| [hw/i3c/core.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/core.c)                                               | I3C bus core (arbitration, CCC, IBI plumbing)   |
+| [hw/i3c/dw-i3c.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/dw-i3c.c)                                           | Synopsys DesignWare I3C master (`TYPE_DW_I3C`)  |
+| [hw/i3c/aspeed_i3c.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/aspeed_i3c.c)                                   | Aspeed AST2600 wrapper around the DW core       |
+| [hw/i3c/mock-i3c-target.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/mock-i3c-target.c)                         | Simple loopback target for testing              |
+| [include/hw/i3c/dw-i3c.h](file:///data00/home/terry.gong/qemu-11-src/include/hw/i3c/dw-i3c.h)                           | `TYPE_DW_I3C = "dw.i3c"` and register map       |
+
+**Zephyr side** — DesignWare I3C driver, upstream since v3.6:
+
+| File                                                                                                                              | Role                                          |
+|-----------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------|
+| [drivers/i3c/i3c_dw.c](file:///data00/home/terry.gong/zephyrproject/zephyr/drivers/i3c/i3c_dw.c)                                  | Main DW I3C driver (matches the QEMU model)   |
+| [dts/bindings/i3c/snps,designware-i3c.yaml](file:///data00/home/terry.gong/zephyrproject/zephyr/dts/bindings/i3c/snps,designware-i3c.yaml) | Devicetree binding                    |
+| [tests/drivers/build_all/i3c/boards/qemu_cortex_m3.overlay](file:///data00/home/terry.gong/zephyrproject/zephyr/tests/drivers/build_all/i3c/boards/qemu_cortex_m3.overlay) | Reference overlay (borrow the node shape)     |
+
+### QEMU virt: allow-list DW I3C on the platform bus
+
+`virt` refuses to instantiate arbitrary `-device` types on its platform
+bus — each device type has to be added to `allowed_dynamic_sysbus_dev`.
+The two required edits are captured in
+[patches/qemu-riscv-virt-allow-dw-i3c.patch](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/qemu-riscv-virt-allow-dw-i3c.patch)
+(apply from the QEMU source top with `patch -p1` or `git apply -p1`):
+
+1. **[hw/riscv/virt.c](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/virt.c)** — include the header
+   and register the type in the machine class init:
+
+   ```c
+   #include "hw/i3c/dw-i3c.h"
+   /* ... inside virt_machine_class_init() ... */
+   machine_class_allow_dynamic_sysbus_dev(mc, TYPE_DW_I3C);
+   ```
+
+2. **[hw/riscv/Kconfig](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/Kconfig)** — pull the I3C
+   modules into the `RISCV_VIRT` config so they get compiled and
+   linked into `qemu-system-riscv64`:
+
+   ```kconfig
+   config RISCV_VIRT
+       ...
+       select I3C
+       select DW_I3C
+   ```
+
+Rebuild QEMU:
+
+```shell
+cd /data00/home/terry.gong/qemu-11-src/build
+../pyvenv/bin/meson --internal regenerate . ..
+ninja qemu-system-riscv64
+cp qemu-system-riscv64 $HOME/qemu-build/bin/
+```
+
+Verify the device is registered:
+
+```shell
+scripts/qemu11.sh riscv64 -machine virt -device 'dw.i3c,help'
+```
+
+Expected: nine properties (`dev-addr-table-depth`, `dev-char-table-depth`,
+`fifo-depth`, ...) instead of "Device 'dw.i3c' not found".
+
+### Zephyr: overlay to expose the DW I3C node
+
+Add a devicetree overlay at
+`boards/qemu_riscv64.overlay` (or pass it via `-DDTC_OVERLAY_FILE=`)
+using the platform-bus MMIO window (`0x04000000`, size `0x02000000` —
+see `virt_memmap[VIRT_PLATFORM_BUS]` in
+[virt.c](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/virt.c#L92)):
+
+```dts
+/ {
+    soc {
+        i3c0: i3c@4000000 {
+            compatible = "snps,designware-i3c";
+            reg = <0x04000000 0x1000>;
+            interrupt-parent = <&plic>;
+            interrupts = <20 1>;
+            #address-cells = <3>;
+            #size-cells = <0>;
+            status = "okay";
+        };
+    };
+};
+```
+
+Enable the driver in `prj.conf`:
+
+```
+CONFIG_I3C=y
+CONFIG_I3C_DW=y
+CONFIG_I3C_SHELL=y
+```
+
+Rebuild Zephyr and boot with the DW I3C device attached to the
+platform bus:
+
+```shell
+west build -d build-qriscv-i3c -b qemu_riscv64 -p always samples/hello_world \
+    -- -DDTC_OVERLAY_FILE=$PWD/qemu_riscv64.overlay
+
+scripts/qemu11.sh riscv64 \
+    -machine virt -smp 1 -nographic -m 256 -bios none \
+    -kernel build-qriscv-i3c/zephyr/zephyr.elf \
+    -device driver=dw.i3c,addr=0x04000000 \
+    -serial mon:stdio
+```
+
+The Zephyr shell's `i3c` command tree can now enumerate and issue CCCs
+against the mock target.
+
+---
+
+## Part 4 — MCTP + PLDM: the Hardware Fault Management stack
+
+Parts 1–3 stand up the emulation substrate. Part 4 is the payload: a
+DMTF PMCI stack (MCTP transport + PLDM application) that lets an OpenBMC
+management controller discover and poll a Zephyr endpoint the way a real
+BMC polls a satellite MCU. All of it is delivered as a numbered set of
+patches under [patches/](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches);
+the full per-patch index (files touched, Kconfig, apply order) lives in
+[patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md),
+and the protocol design in
+[docs/pldm-mctp-i3c-design.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/docs/pldm-mctp-i3c-design.md).
+
+### What the stack contains
+
+| Layer | Spec | Where | Patch |
+|---|---|---|---|
+| MCTP over I3C | DSP0233 | Zephyr `subsys/pmci/mctp` | 0001 |
+| MCTP over SMBus/I2C | DSP0237 | Zephyr `subsys/pmci/mctp` | 0003 |
+| MCTP over serial | DSP0253 | Zephyr `subsys/pmci/mctp` | 0005 |
+| MCTP control (Set/Get EID, msg-type) | DSP0236 | Zephyr `subsys/pmci/mctp` | 0008 |
+| PLDM subsystem + Type 0 (discovery) | DSP0240 | Zephyr `subsys/pmci/pldm` | 0002 |
+| PLDM Type 2 (platform monitoring) + PDR | DSP0248 | Zephyr `subsys/pmci/pldm` | 0007 |
+| OpenBMC MCTP + PLDM over serial (evb-ast2600) | — | Yocto layers | 0004 |
+| OpenBMC mctpd auto-discovery delta | — | Yocto layers | 0006 |
+
+The Zephyr side vendors [openbmc/libpldm](https://github.com/openbmc/libpldm)
+as a west module for wire encode/decode and layers on top of Zephyr's
+existing libmctp. The OpenBMC side flips on `mctp` + `pldm`
+`DISTRO_FEATURES` for the `evb-ast2600` machine and runs the stock
+`mctpd` (kernel AF_MCTP) + `pldmd`.
+
+### The realized topology — two QEMU instances over MCTP-serial
+
+Upstream QEMU ships no I3C/I2C *target-mode* model, so the live
+inter-QEMU link is **MCTP-over-serial (DSP0253)** across a `-serial
+unix:` socket between the two QEMU processes (I3C/I2C bindings are still
+built and loopback-tested, just not wired between two QEMUs):
+
+```
+  Zephyr QEMU (sifive_u)                    OpenBMC QEMU (ast2600-evb)
+  +------------------------------+          +---------------------------+
+  | serial_bridge sample         |          | pldmd (PLDM Type 0/2)     |
+  |   PLDM Type 0 + Type 2 resp   |          | mctpd (AF_MCTP, EID 8)    |
+  |   MCTP control responder      |          | kernel mctp-serial        |
+  |   mctp_serial (DSP0253)       |          |                           |
+  |  uart1 <------ unix socket ------------> UART1 = /dev/ttyS0          |
+  +------------------------------+          +---------------------------+
+        EID 18 (endpoint)                     console stays on UART5/ttyS4
+```
+
+### Run the bridge (prebuilt binaries)
+
+`scripts/launch_openbmc.sh` is the socket **server** (start it first);
+`scripts/launch_hfm.sh` is the **client**. Both share `MCTP_SOCK`
+(default `/tmp/hfm-mctp.sock`) and put the MCTP link on each side's
+**second** `-serial` backend, leaving the first as the console:
+
+```shell
+cd scripts
+MCTP_SOCK=/tmp/hfm-mctp.sock ./launch_openbmc.sh    # terminal 1 (server)
+MCTP_SOCK=/tmp/hfm-mctp.sock ./launch_hfm.sh        # terminal 2 (client)
+```
+
+Once both are up, from the BMC console bring the link up and talk PLDM
+to EID 18:
+
+```shell
+mctp link set mctpserial0 up
+mctp addr add 8 dev mctpserial0
+# route to EID 18 — see the busy-loop note below
+pldmtool base GetTID -m 18
+pldmtool base GetPLDMTypes -m 18
+pldmtool platform GetPDR -m 18 -d 0
+pldmtool platform GetSensorReading -m 18 -i 1
+```
+
+`scripts/two_qemu_smoke.py` automates this end to end (boots both
+instances, brings up `mctpserial0`, installs the route, runs
+`pldmtool`).
+
+### Build the Zephyr endpoint from source
+
+Apply the Zephyr patches (see
+[patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md#L468)
+for the full `git am` order) and build the bridge sample for the
+`sifive_u`-compatible board:
+
+```shell
+cd $ZEPHYR_DIR/zephyr
+west build -b hifive_unleashed/fu540/u54 -p always \
+    samples/subsys/pmci/pldm/serial_bridge
+
+scripts/qemu11.sh riscv64 -machine sifive_u -smp 2 -m 256 -nographic \
+    -bios none -kernel build/zephyr/zephyr.elf \
+    -serial mon:stdio -serial unix:/tmp/hfm-mctp.sock
+```
+
+### Known limitation — mctpd auto-discovery on this kernel
+
+The BMC's kernel (`6.6.92`) has an **AF_MCTP netlink-dump busy-loop**:
+`mctpd` calls `fill_linkmap()` (`RTM_GETLINK | NLM_F_DUMP`) at startup,
+the dump spins in the kernel, and the event loop never advances — so
+`mctpd`'s automatic `SetupEndpoint` cannot complete and its `mctp
+route`/`addr` CLI dump paths also hang. The MCTP/PLDM responders were
+therefore validated by installing the route to EID 18 with a raw-netlink
+helper (`scripts/mctp_route_add.c`, `RTM_NEWROUTE` — sets, never dumps)
+and addressing EID 18 directly with `pldmtool`. `GetTID`,
+`GetPLDMTypes`, `GetPDR` (Terminus Locator PDR, EID 18) and
+`GetSensorReading` (presentReading 31) all answer correctly over the
+**real** kernel AF_MCTP transport. Full evidence is in
+[docs/pldm-mctp-i3c-design.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/docs/pldm-mctp-i3c-design.md)
+§10c and the patch 0006 environment note. A kernel with a working
+AF_MCTP dump would let `mctpd` self-discover the endpoint.
+
+---
+
+## Appendix — OpenBMC AST2600 QEMU instance
+
+Login: user `root` / password `0penBmc` (leading zero, lowercase o).
 
 ### Use prebuilt binaries
 
@@ -56,21 +488,21 @@ Please use user name 'root' and password '0penBmc'
 cd scripts
 ./launch_openbmc.sh
 ```
-#### WebUI hyperlink
-WebUI hyperlink for local development machine
-```shell
+
+WebUI (local):
+```
 https://127.0.0.1:1443
 ```
 
-WebUI hyperlink for remote development machine
-```shell
+WebUI (remote):
+```
 https://$TARGETIP:1443
 ```
 
 ### Build OpenBMC image from scratch
 
-Requires ~50 GB of free disk and 3-8 hours depending on the machine and
-network. Yocto downloads several GB of source archives on the first run.
+Requires ~50 GB free disk and 3–8 hours. Yocto downloads several GB of
+source archives on the first run.
 
 ```shell
 git clone https://github.com/openbmc/openbmc.git openbmc
@@ -96,94 +528,16 @@ bitbake obmc-phosphor-image
 ```
 
 If bitbake aborts with `OSError: [Errno 30] Read-only file system:
-'/proc/self/uid_map'`, the sandbox blocks writing uid_map even for root.
-Apply the patch under `patches/`:
+'/proc/self/uid_map'`, the sandbox blocks writing uid_map even for
+root. Apply the patch under `patches/`:
 
 ```shell
 cd openbmc
 patch -p1 < ../patches/openbmc-bitbake-disable_network-erofs.patch
 ```
 
-The OpenBMC MTD image will be generated at
-```shell
+The MTD image lands at:
+
+```
 $OPENBMC_CODE_BASE/build/evb-ast2600/tmp/deploy/images/evb-ast2600/obmc-phosphor-image-evb-ast2600-$BUILD_TIME.static.mtd
-```
-
-## Hardware Fault Management QEMU instance
-
-Hardware Fault Management instance is based on zephyr porject, please use
-following command to launch Hardware Fault Management QEMU instance
-
-### Use prebuilt binaries
-
-```shell
-cd scripts
-./launch_hfm.sh
-```
-
-### Build zephyr image from scratch
-
-The prebuilt `prebuilts/zephyr.elf` is `v4.3.0-3029-g7cd0913f3120`. To
-reproduce a Zephyr image that boots the same way, pin the tree to a
-release tag (main requires Zephyr SDK >= 1.0, which the current SDK does
-not provide) and pass the QEMU-friendly SRAM overlay to the build:
-
-```shell
-export ZEPHYR_DIR=zephyr_project
-
-# Install west tool if not available
-if ! command -v west >/dev/null 2>&1; then
-    echo "Installing west tool..."
-    pip3 install west --break-system-packages
-fi
-
-python3 -m venv $ZEPHYR_DIR/.venv
-source $ZEPHYR_DIR/.venv/bin/activate
-
-# Pin the manifest to a release tag; without --mr, west init pulls the
-# main branch, which requires Zephyr SDK 1.0+.
-west init --mr v4.3.0 $ZEPHYR_DIR
-cd $ZEPHYR_DIR
-west update
-
-west zephyr-export
-
-cd zephyr
-west sdk install
-
-# NOTE: hifive_unmatched's default DTS pins zephyr,sram to L2 LIM
-# (0x08000000), which QEMU's sifive_u machine does not implement.
-# The overlay redirects zephyr,sram to ram0 (DDR at 0x80000000) and
-# shrinks ram0 to match `qemu -m 256`, otherwise the heap init trips
-# a Store/AMO access fault at the top of the 16 GiB DDR region.
-#
-# QEMU's sifive_u_prci model also does not implement the PLL_LOCK
-# bit, so soc_early_init_hook busy-loops forever waiting for it.
-# Apply the timeout patch to keep the boot moving:
-patch -p1 -d zephyr < ../../patches/zephyr-fu700-pll-lock-qemu-timeout.patch
-
-west build -b hifive_unmatched/fu740/u74 -p always samples/hello_world/ \
-    -- -DDTC_OVERLAY_FILE=$(pwd)/../../patches/zephyr-qemu-hifive.overlay
-
-# `west build -t run` does not support hifive_unmatched (its board.cmake
-# only lists renode as a supported emulator). Launch the produced ELF
-# with the same QEMU command that scripts/launch_hfm.sh uses:
-qemu-system-riscv64 \
-    -machine sifive_u -smp 5 -nographic -m 256 -bios none \
-    -kernel build/zephyr/zephyr.elf \
-    -serial mon:stdio
-
-deactivate
-```
-
-Expected output:
-
-```
-*** Booting Zephyr OS build v4.3.0 ***
-Hello World! hifive_unmatched/fu740/u74
-```
-
-The Zephyr ELF will be generated at
-```shell
- $ZEPHYR_DIR/zephyr/build/zephyr/zephyr.elf
 ```

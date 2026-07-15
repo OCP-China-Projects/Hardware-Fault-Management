@@ -1,0 +1,1459 @@
+From 6abee38ef47c1f19b816657cb33d3bc7372f0d81 Mon Sep 17 00:00:00 2001
+From: HFM <hfm@example.com>
+Date: Tue, 7 Jul 2026 10:30:59 +0800
+Subject: [PATCH] subsys/pmci: add PLDM subsystem and DSP0240 Type 0 support
+
+Add a PLDM subsystem that layers DMTF DSP0240 messaging on top of the
+existing MCTP core. It is transport-agnostic: any binding registered
+with libmctp (mctp_i3c, mctp_uart, mctp_i2c_gpio, ...) automatically
+carries PLDM without further glue.
+
+Key pieces:
+
+  * include/zephyr/pmci/pldm/pldm.h      - public API:
+      pldm_ctx_init(), pldm_register_type(), pldm_send_request_sync().
+
+  * subsys/pmci/pldm/pldm.c              - core dispatcher.
+      Registers as libmctp's rx_all callback; strips the MCTP type byte
+      (0x01, PLDM per DSP0240 Table 1) and hands the message to either
+      the responder (via a per-type handler table) or the requester
+      (via an instance-id-keyed slot).
+
+  * subsys/pmci/pldm/pldm_base.c         - Type 0 support.
+      SetTID (0x01), GetTID (0x02), GetPLDMVersion (0x03),
+      GetPLDMTypes (0x04), GetPLDMCommands (0x05). Encode/decode is
+      delegated to openbmc/libpldm.
+
+  * samples/subsys/pmci/pldm/type0_loopback - regression sample.
+      Two MCTP contexts wired to an in-memory loopback binding
+      exercise Type 0 requester and responder end-to-end. Runs under
+      qemu_riscv32 and qemu_x86 in ~1 s.
+
+  * west.yml                             - register openbmc/libpldm as
+      a Zephyr module (pinned to df0a2219).
+
+Signed-off-by: HFM <hfm@example.com>
+---
+ include/zephyr/pmci/pldm/pldm.h               | 149 +++++++
+ include/zephyr/pmci/pldm/pldm_base.h          |  59 +++
+ .../pmci/pldm/type0_loopback/CMakeLists.txt   |   9 +
+ .../pmci/pldm/type0_loopback/README.rst       |  32 ++
+ .../subsys/pmci/pldm/type0_loopback/prj.conf  |  15 +
+ .../pmci/pldm/type0_loopback/sample.yaml      |  23 +
+ .../pmci/pldm/type0_loopback/src/main.c       | 163 +++++++
+ subsys/pmci/CMakeLists.txt                    |   1 +
+ subsys/pmci/Kconfig                           |   1 +
+ subsys/pmci/pldm/CMakeLists.txt               |   6 +
+ subsys/pmci/pldm/Kconfig                      |  79 ++++
+ subsys/pmci/pldm/pldm.c                       | 357 ++++++++++++++++
+ subsys/pmci/pldm/pldm_base.c                  | 399 ++++++++++++++++++
+ west.yml                                      |   4 +
+ 14 files changed, 1297 insertions(+)
+ create mode 100644 include/zephyr/pmci/pldm/pldm.h
+ create mode 100644 include/zephyr/pmci/pldm/pldm_base.h
+ create mode 100644 samples/subsys/pmci/pldm/type0_loopback/CMakeLists.txt
+ create mode 100644 samples/subsys/pmci/pldm/type0_loopback/README.rst
+ create mode 100644 samples/subsys/pmci/pldm/type0_loopback/prj.conf
+ create mode 100644 samples/subsys/pmci/pldm/type0_loopback/sample.yaml
+ create mode 100644 samples/subsys/pmci/pldm/type0_loopback/src/main.c
+ create mode 100644 subsys/pmci/pldm/CMakeLists.txt
+ create mode 100644 subsys/pmci/pldm/Kconfig
+ create mode 100644 subsys/pmci/pldm/pldm.c
+ create mode 100644 subsys/pmci/pldm/pldm_base.c
+
+diff --git a/include/zephyr/pmci/pldm/pldm.h b/include/zephyr/pmci/pldm/pldm.h
+new file mode 100644
+index 00000000000..9db0ac85084
+--- /dev/null
++++ b/include/zephyr/pmci/pldm/pldm.h
+@@ -0,0 +1,149 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_H_
++#define ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_H_
++
++#include <stddef.h>
++#include <stdint.h>
++#include <zephyr/kernel.h>
++#include <libmctp.h>
++#include <libpldm/base.h>
++#include <libpldm/pldm_types.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @file
++ * @brief Zephyr PLDM (DSP0240) subsystem over MCTP.
++ *
++ * The subsystem multiplexes PLDM traffic on top of the MCTP message-type
++ * byte (0x01, DSP0240 §4.1). Each PLDM type registers a handler and is
++ * dispatched by pldm.c; requesters allocate an instance-id from a pool
++ * and block on a per-request completion semaphore until the response
++ * arrives.
++ */
++
++/** MCTP message type for PLDM as per DSP0240 Table 1. */
++#define PLDM_MCTP_MSG_TYPE 0x01
++
++struct pldm_ctx;
++
++/**
++ * @brief Responder handler for a single PLDM type.
++ *
++ * @param ctx        Context that received the request.
++ * @param src_eid    Source EID of the requester (MCTP layer).
++ * @param req        Request message (header + payload, no MCTP type byte).
++ * @param req_len    Length of @p req in bytes.
++ * @param resp       Buffer to fill with the response (header + payload).
++ * @param resp_size  Capacity of @p resp on entry.
++ * @param resp_len   Actual response length on exit.
++ *
++ * @return 0 on success. On failure return a negative errno; the core will
++ *         synthesise a CC-only response using the appropriate PLDM
++ *         completion code.
++ */
++typedef int (*pldm_type_handler_fn)(struct pldm_ctx *ctx, uint8_t src_eid,
++				    const struct pldm_msg *req, size_t req_len,
++				    struct pldm_msg *resp, size_t resp_size,
++				    size_t *resp_len);
++
++/**
++ * @brief Per-endpoint PLDM state.
++ *
++ * One @ref pldm_ctx corresponds to a single MCTP endpoint. The subsystem
++ * hooks into libmctp via mctp_set_rx_all() so all PLDM traffic destined
++ * for the local EID lands in @ref pldm_ctx_rx().
++ */
++struct pldm_ctx {
++	struct mctp *mctp;
++	mctp_eid_t local_eid;
++
++#if defined(CONFIG_PLDM_RESPONDER)
++	pldm_type_handler_fn handlers[PLDM_MAX_TYPES];
++#endif
++
++#if defined(CONFIG_PLDM_REQUESTER)
++	struct k_mutex req_lock;
++	struct k_sem req_slot_sem;
++	struct pldm_request_slot {
++		bool used;
++		uint8_t instance_id;
++		uint8_t pldm_type;
++		uint8_t command;
++		mctp_eid_t peer_eid;
++		struct k_sem done;
++		uint8_t resp_buf[CONFIG_PLDM_REQUESTER_MAX_PAYLOAD];
++		size_t resp_len;
++		int rc;
++	} slots[CONFIG_PLDM_MAX_INSTANCES];
++#endif
++};
++
++/**
++ * @brief Initialise a PLDM context bound to an MCTP endpoint.
++ *
++ * Registers @c pldm_ctx_rx() as the MCTP receive callback for @p mctp.
++ * The caller is expected to have already registered a binding with the
++ * MCTP core via mctp_register_bus().
++ *
++ * @return 0 on success, negative errno otherwise.
++ */
++int pldm_ctx_init(struct pldm_ctx *ctx, struct mctp *mctp, mctp_eid_t eid);
++
++/**
++ * @brief Feed one MCTP message into the PLDM dispatcher.
++ *
++ * Wired to libmctp's @c mctp_rx_fn signature; users normally never call
++ * this directly. Exposed for unit tests and for loopback plumbing.
++ */
++void pldm_ctx_rx(uint8_t src_eid, bool tag_owner, uint8_t msg_tag, void *data,
++		 void *msg, size_t len);
++
++#if defined(CONFIG_PLDM_RESPONDER)
++/**
++ * @brief Register a responder handler for a single PLDM type.
++ *
++ * @param pldm_type One of @ref pldm_supported_types.
++ * @param fn        Handler invoked for every request targeting @p pldm_type.
++ *
++ * @return 0 on success, -EINVAL if the type is out of range, -EEXIST if a
++ *         handler for @p pldm_type is already registered.
++ */
++int pldm_register_type(struct pldm_ctx *ctx, uint8_t pldm_type,
++		       pldm_type_handler_fn fn);
++#endif
++
++#if defined(CONFIG_PLDM_REQUESTER)
++/**
++ * @brief Send a PLDM request and block until a response arrives.
++ *
++ * @param ctx       Local PLDM context.
++ * @param peer_eid  Destination EID (must have a route via the MCTP core).
++ * @param pldm_type Value copied into the PLDM header @c type field.
++ * @param command   Value copied into the PLDM header @c command field.
++ * @param req_body  Payload following the PLDM header. May be NULL.
++ * @param req_len   Length of @p req_body.
++ * @param resp_buf  Buffer receiving the full response (header + payload).
++ * @param resp_size Capacity of @p resp_buf.
++ * @param resp_len  On success, the number of bytes written into @p resp_buf.
++ *
++ * @return 0 on success. Negative errno on transport / timeout failures.
++ */
++int pldm_send_request_sync(struct pldm_ctx *ctx, mctp_eid_t peer_eid,
++			   uint8_t pldm_type, uint8_t command,
++			   const void *req_body, size_t req_len,
++			   void *resp_buf, size_t resp_size, size_t *resp_len);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_H_ */
+diff --git a/include/zephyr/pmci/pldm/pldm_base.h b/include/zephyr/pmci/pldm/pldm_base.h
+new file mode 100644
+index 00000000000..318581f307a
+--- /dev/null
++++ b/include/zephyr/pmci/pldm/pldm_base.h
+@@ -0,0 +1,59 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_BASE_H_
++#define ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_BASE_H_
++
++#include <stdint.h>
++#include <zephyr/pmci/pldm/pldm.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/**
++ * @file
++ * @brief DSP0240 PLDM Type 0 (Messaging Control and Discovery) helpers.
++ */
++
++/**
++ * @brief Install the Type 0 responder into @p ctx.
++ *
++ * Registers a handler that services SetTID / GetTID / GetPLDMVersion /
++ * GetPLDMTypes / GetPLDMCommands. The initial TID is taken from
++ * @c CONFIG_PLDM_BASE_INITIAL_TID.
++ */
++int pldm_base_responder_register(struct pldm_ctx *ctx);
++
++/**
++ * @brief Retrieve the Terminus ID currently advertised by the responder.
++ */
++uint8_t pldm_base_get_tid(void);
++
++/**
++ * @brief Override the advertised Terminus ID (mirrors a SetTID from the wire).
++ */
++void pldm_base_set_tid(uint8_t tid);
++
++#if defined(CONFIG_PLDM_REQUESTER)
++/** Send GetTID and populate @p tid on success. */
++int pldm_base_get_tid_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
++			   uint8_t *tid);
++
++/** Send GetPLDMTypes and populate @p types (bit N set => type N supported). */
++int pldm_base_get_types_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
++			     uint8_t types[8]);
++
++/** Send GetPLDMVersion for one PLDM type and populate @p version. */
++int pldm_base_get_version_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
++			       uint8_t pldm_type, ver32_t *version);
++#endif
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_PMCI_PLDM_PLDM_BASE_H_ */
+diff --git a/samples/subsys/pmci/pldm/type0_loopback/CMakeLists.txt b/samples/subsys/pmci/pldm/type0_loopback/CMakeLists.txt
+new file mode 100644
+index 00000000000..5100d7155a7
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/type0_loopback/CMakeLists.txt
+@@ -0,0 +1,9 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(pldm_type0_loopback)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/subsys/pmci/pldm/type0_loopback/README.rst b/samples/subsys/pmci/pldm/type0_loopback/README.rst
+new file mode 100644
+index 00000000000..c2fe11a6013
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/type0_loopback/README.rst
+@@ -0,0 +1,32 @@
++.. zephyr:code-sample:: pldm_type0_loopback
++   :name: PLDM Type 0 loopback
++   :relevant-api: mctp pldm_subsys
++
++   Exercise the DSP0240 Type 0 (Messaging Control and Discovery) commands
++   between a requester and a responder wired together over an in-memory
++   MCTP binding.
++
++Overview
++********
++
++The sample creates two Zephyr :c:type:`struct pldm_ctx` contexts sharing a
++pair of in-memory MCTP bindings whose ``tx`` callbacks cross-forward the
++packet to the peer's ``mctp_bus_rx()``. This lets the PLDM subsystem be
++exercised end-to-end without any hardware transport.
++
++The responder side registers the Type 0 responder from
++``subsys/pmci/pldm/pldm_base.c``. The requester side then issues:
++
++* ``GetTID``          - DSP0240 §9.2
++* ``GetPLDMTypes``    - DSP0240 §9.3
++* ``GetPLDMVersion``  - DSP0240 §9.4 (for the ``PLDM_BASE`` type)
++
++On success the sample prints ``PLDM Type 0 loopback OK`` and exits.
++
++Building and running
++********************
++
++.. zephyr-app-commands::
++   :zephyr-app: samples/subsys/pmci/pldm/type0_loopback
++   :board: qemu_riscv32
++   :goals: run
+diff --git a/samples/subsys/pmci/pldm/type0_loopback/prj.conf b/samples/subsys/pmci/pldm/type0_loopback/prj.conf
+new file mode 100644
+index 00000000000..4dced6862ac
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/type0_loopback/prj.conf
+@@ -0,0 +1,15 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++CONFIG_MCTP=y
++CONFIG_MCTP_HEAP_SIZE=4096
++
++CONFIG_PLDM_SUBSYS=y
++CONFIG_PLDM_RESPONDER=y
++CONFIG_PLDM_REQUESTER=y
++CONFIG_PLDM_TYPE_BASE=y
++
++CONFIG_LOG=y
++CONFIG_LOG_BUFFER_SIZE=4096
++CONFIG_PLDM_LOG_LEVEL_INF=y
++CONFIG_MAIN_STACK_SIZE=4096
+diff --git a/samples/subsys/pmci/pldm/type0_loopback/sample.yaml b/samples/subsys/pmci/pldm/type0_loopback/sample.yaml
+new file mode 100644
+index 00000000000..ea3dfbd9d04
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/type0_loopback/sample.yaml
+@@ -0,0 +1,23 @@
++sample:
++  description: PLDM Type 0 (DSP0240) requester/responder round-trip over an
++    in-memory MCTP loopback binding.
++  name: pldm_type0_loopback
++common:
++  tags:
++    - pmci
++    - mctp
++    - pldm
++tests:
++  sample.pmci.pldm.type0_loopback:
++    integration_platforms:
++      - qemu_riscv32
++      - qemu_x86
++    harness: console
++    harness_config:
++      type: multi_line
++      ordered: true
++      regex:
++        - "GetTID -> 0x[0-9a-fA-F]+"
++        - "GetPLDMTypes -> byte0=0x01"
++        - "GetPLDMVersion\\(BASE\\) -> [0-9]+\\.[0-9]+\\.[0-9]+"
++        - "PLDM Type 0 loopback OK"
+diff --git a/samples/subsys/pmci/pldm/type0_loopback/src/main.c b/samples/subsys/pmci/pldm/type0_loopback/src/main.c
+new file mode 100644
+index 00000000000..09d287479cb
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/type0_loopback/src/main.c
+@@ -0,0 +1,163 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM Type 0 end-to-end sample.
++ *
++ * Two MCTP endpoints share an in-process loopback binding: each binding's
++ * tx callback deposits the packet on its peer's rx path. The requester EID
++ * asks the responder EID for TID / supported types / base-type version.
++ * This exercises the entire PLDM stack (subsys/pmci/pldm) without needing
++ * a hardware transport.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/logging/log.h>
++#include <zephyr/sys/util.h>
++
++#include <libmctp.h>
++#include <libpldm/base.h>
++#include <libpldm/pldm_types.h>
++
++#include <zephyr/pmci/pldm/pldm.h>
++#include <zephyr/pmci/pldm/pldm_base.h>
++
++LOG_MODULE_REGISTER(sample, LOG_LEVEL_INF);
++
++#define EID_REQUESTER 0x10
++#define EID_RESPONDER 0x20
++
++struct loopback_binding {
++	struct mctp_binding binding;
++	struct mctp_binding *peer; /* target of every tx */
++};
++
++static int loopback_start(struct mctp_binding *b)
++{
++	mctp_binding_set_tx_enabled(b, true);
++	return 0;
++}
++
++/*
++ * Move a packet across to the peer binding. Note that libmctp expects the
++ * receiver to take ownership of the pktbuf, so we duplicate to avoid the
++ * original tx path double-freeing. mctp_pktbuf_alloc + mctp_pktbuf_push
++ * preserves the header byte alignment for the receiving core.
++ */
++static int loopback_tx(struct mctp_binding *b, struct mctp_pktbuf *pkt)
++{
++	struct loopback_binding *self =
++		CONTAINER_OF(b, struct loopback_binding, binding);
++	struct mctp_pktbuf *copy;
++	size_t sz = mctp_pktbuf_size(pkt);
++
++	copy = mctp_pktbuf_alloc(self->peer, 0);
++	if (copy == NULL) {
++		return -ENOMEM;
++	}
++	if (mctp_pktbuf_push(copy, mctp_pktbuf_hdr(pkt), sz) != 0) {
++		mctp_pktbuf_free(copy);
++		return -ENOMEM;
++	}
++	mctp_bus_rx(self->peer, copy);
++	return 0;
++}
++
++static void loopback_init(struct loopback_binding *lb, const char *name)
++{
++	memset(lb, 0, sizeof(*lb));
++	lb->binding.name = name;
++	lb->binding.version = 1;
++	lb->binding.pkt_size = MCTP_PACKET_SIZE(MCTP_BTU);
++	lb->binding.pkt_header = 0;
++	lb->binding.pkt_trailer = 0;
++	lb->binding.start = loopback_start;
++	lb->binding.tx = loopback_tx;
++}
++
++static struct mctp *mctp_req, *mctp_resp;
++static struct loopback_binding lb_req, lb_resp;
++static struct pldm_ctx ctx_req, ctx_resp;
++
++int main(void)
++{
++	uint8_t types[8] = { 0 };
++	uint8_t tid = 0;
++	ver32_t ver;
++	int rc;
++
++	mctp_set_alloc_ops(malloc, free, realloc);
++
++	mctp_req = mctp_init();
++	mctp_resp = mctp_init();
++	if (mctp_req == NULL || mctp_resp == NULL) {
++		LOG_ERR("mctp_init failed");
++		return -1;
++	}
++
++	loopback_init(&lb_req, "lb_req");
++	loopback_init(&lb_resp, "lb_resp");
++	lb_req.peer = &lb_resp.binding;
++	lb_resp.peer = &lb_req.binding;
++
++	rc = mctp_register_bus(mctp_req, &lb_req.binding, EID_REQUESTER);
++	if (rc != 0) {
++		LOG_ERR("mctp_register_bus(req) rc=%d", rc);
++		return -1;
++	}
++	rc = mctp_register_bus(mctp_resp, &lb_resp.binding, EID_RESPONDER);
++	if (rc != 0) {
++		LOG_ERR("mctp_register_bus(resp) rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_ctx_init(&ctx_req, mctp_req, EID_REQUESTER);
++	if (rc != 0) {
++		LOG_ERR("pldm_ctx_init(req) rc=%d", rc);
++		return -1;
++	}
++	rc = pldm_ctx_init(&ctx_resp, mctp_resp, EID_RESPONDER);
++	if (rc != 0) {
++		LOG_ERR("pldm_ctx_init(resp) rc=%d", rc);
++		return -1;
++	}
++	rc = pldm_base_responder_register(&ctx_resp);
++	if (rc != 0) {
++		LOG_ERR("pldm_base_responder_register rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_base_get_tid_sync(&ctx_req, EID_RESPONDER, &tid);
++	if (rc != 0) {
++		LOG_ERR("GetTID rc=%d", rc);
++		return -1;
++	}
++	printk("GetTID -> 0x%02x\n", tid);
++
++	rc = pldm_base_get_types_sync(&ctx_req, EID_RESPONDER, types);
++	if (rc != 0) {
++		LOG_ERR("GetPLDMTypes rc=%d", rc);
++		return -1;
++	}
++	printk("GetPLDMTypes -> byte0=0x%02x\n", types[0]);
++
++	rc = pldm_base_get_version_sync(&ctx_req, EID_RESPONDER, PLDM_BASE,
++					&ver);
++	if (rc != 0) {
++		LOG_ERR("GetPLDMVersion rc=%d", rc);
++		return -1;
++	}
++	/*
++	 * ver32_t stores each digit as a BCD-ish nibble; 0xf1 == "1", 0xf0 ==
++	 * "0". Print the interpretation the sample.yaml regex expects.
++	 */
++	printk("GetPLDMVersion(BASE) -> %u.%u.%u\n", ver.major & 0x0f,
++	       ver.minor & 0x0f, ver.update & 0x0f);
++
++	printk("PLDM Type 0 loopback OK\n");
++	return 0;
++}
+diff --git a/subsys/pmci/CMakeLists.txt b/subsys/pmci/CMakeLists.txt
+index 931aeaada5b..437808c9fbd 100644
+--- a/subsys/pmci/CMakeLists.txt
++++ b/subsys/pmci/CMakeLists.txt
+@@ -1,3 +1,4 @@
+ # SPDX-License-Identifier: Apache-2.0
+ 
+ add_subdirectory_ifdef(CONFIG_MCTP mctp)
++add_subdirectory_ifdef(CONFIG_PLDM_SUBSYS pldm)
+diff --git a/subsys/pmci/Kconfig b/subsys/pmci/Kconfig
+index 7f7a04029c9..399fd9542f2 100644
+--- a/subsys/pmci/Kconfig
++++ b/subsys/pmci/Kconfig
+@@ -8,6 +8,7 @@ menu "Platform Management Communications Infrastructure (PMCI)"
+ # zephyr-keep-sorted-start
+ 
+ source "subsys/pmci/mctp/Kconfig"
++source "subsys/pmci/pldm/Kconfig"
+ 
+ # zephyr-keep-sorted-stop
+ 
+diff --git a/subsys/pmci/pldm/CMakeLists.txt b/subsys/pmci/pldm/CMakeLists.txt
+new file mode 100644
+index 00000000000..8f412d5410b
+--- /dev/null
++++ b/subsys/pmci/pldm/CMakeLists.txt
+@@ -0,0 +1,6 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++zephyr_library()
++zephyr_library_sources(pldm.c)
++zephyr_library_sources_ifdef(CONFIG_PLDM_TYPE_BASE pldm_base.c)
+diff --git a/subsys/pmci/pldm/Kconfig b/subsys/pmci/pldm/Kconfig
+new file mode 100644
+index 00000000000..51950363e15
+--- /dev/null
++++ b/subsys/pmci/pldm/Kconfig
+@@ -0,0 +1,79 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++menuconfig PLDM_SUBSYS
++	bool "Platform Level Data Model (PLDM) subsystem [EXPERIMENTAL]"
++	depends on MCTP
++	select PLDM
++	select EXPERIMENTAL
++	help
++	  Enable the Zephyr PLDM subsystem. Layers the DSP0240 messaging
++	  protocol on top of the MCTP core so multiple PLDM types can share
++	  one MCTP endpoint. The underlying encode/decode is provided by the
++	  openbmc/libpldm module.
++
++if PLDM_SUBSYS
++
++config PLDM_RESPONDER
++	bool "PLDM responder role"
++	default y
++	help
++	  Enable the responder path: incoming PLDM requests are dispatched
++	  to a per-type handler that produces a response.
++
++config PLDM_REQUESTER
++	bool "PLDM requester role"
++	default y
++	help
++	  Enable the requester path: pldm_send_request_sync() allocates an
++	  instance-id, sends the request and blocks until the matching
++	  response arrives or the timeout expires.
++
++config PLDM_REQUESTER_TIMEOUT_MS
++	int "PLDM requester per-request timeout (ms)"
++	depends on PLDM_REQUESTER
++	default 2000
++	range 100 60000
++	help
++	  Maximum time pldm_send_request_sync() waits for a response before
++	  giving up. DSP0240 recommends 2 s for the base type.
++
++config PLDM_REQUESTER_MAX_PAYLOAD
++	int "PLDM requester response buffer size (bytes)"
++	depends on PLDM_REQUESTER
++	default 256
++	range 32 4096
++	help
++	  Size of the per-request staging buffer that captures an incoming
++	  response payload before it is copied out to the caller.
++
++config PLDM_MAX_INSTANCES
++	int "PLDM concurrent in-flight requests"
++	depends on PLDM_REQUESTER
++	default 4
++	range 1 32
++	help
++	  Number of PLDM requests that may be in flight concurrently on a
++	  given context. Bounded by the 5-bit instance-id field to 32.
++
++config PLDM_TYPE_BASE
++	bool "PLDM Type 0 (Messaging Control and Discovery, DSP0240)"
++	default y
++	help
++	  Compile the Type 0 responder and requester helpers: GetTID / SetTID
++	  / GetPLDMVersion / GetPLDMTypes / GetPLDMCommands.
++
++config PLDM_BASE_INITIAL_TID
++	int "Initial PLDM Terminus ID advertised before SetTID"
++	depends on PLDM_TYPE_BASE
++	default 1
++	range 1 254
++	help
++	  Value returned by GetTID before the requester calls SetTID.
++	  0x00 and 0xff are reserved by DSP0240 §8.
++
++module = PLDM
++module-str = PLDM
++source "subsys/logging/Kconfig.template.log_config"
++
++endif # PLDM_SUBSYS
+diff --git a/subsys/pmci/pldm/pldm.c b/subsys/pmci/pldm/pldm.c
+new file mode 100644
+index 00000000000..f3e18f62e3e
+--- /dev/null
++++ b/subsys/pmci/pldm/pldm.c
+@@ -0,0 +1,357 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM (DSP0240) core dispatcher for Zephyr.
++ *
++ * Sits on top of libmctp: registers a single mctp_rx_fn that strips the
++ * MCTP message-type byte (0x01) and delivers the PLDM message to either
++ *   - the responder handler registered for the target PLDM type, or
++ *   - the requester slot that owns the (peer_eid, type, command,
++ *     instance_id) tuple.
++ *
++ * libpldm is used purely for wire encode/decode; state (instance-id pool,
++ * per-type handler table, per-request completion) lives here.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/sys/byteorder.h>
++#include <zephyr/logging/log.h>
++
++#include <libmctp.h>
++#include <libpldm/base.h>
++#include <libpldm/pldm.h>
++
++#include <zephyr/pmci/pldm/pldm.h>
++
++LOG_MODULE_REGISTER(pldm, CONFIG_PLDM_LOG_LEVEL);
++
++/*
++ * Staging buffer for outbound MCTP messages. One byte for the MCTP
++ * type prefix (0x01), followed by the PLDM message.
++ */
++#define PLDM_TX_BUF_SZ (1U + CONFIG_PLDM_REQUESTER_MAX_PAYLOAD)
++
++static inline struct pldm_msg *pldm_msg_from(uint8_t *buf)
++{
++	return (struct pldm_msg *)buf;
++}
++
++#if defined(CONFIG_PLDM_RESPONDER)
++
++/*
++ * Build a completion-code-only response and send it via MCTP. Used when a
++ * handler returns an error or when no handler is registered for the
++ * requested type.
++ */
++static void pldm_send_cc_resp(struct pldm_ctx *ctx, mctp_eid_t peer,
++			      uint8_t msg_tag, const struct pldm_msg *req,
++			      uint8_t cc)
++{
++	uint8_t buf[1 + sizeof(struct pldm_msg_hdr) + 1];
++	struct pldm_msg *resp = pldm_msg_from(&buf[1]);
++	int rc;
++
++	buf[0] = PLDM_MCTP_MSG_TYPE;
++	rc = encode_cc_only_resp(req->hdr.instance_id, req->hdr.type,
++				 req->hdr.command, cc, resp);
++	if (rc != PLDM_SUCCESS) {
++		LOG_ERR("encode_cc_only_resp failed: %d", rc);
++		return;
++	}
++
++	rc = mctp_message_tx(ctx->mctp, peer, MCTP_MESSAGE_TO_SRC, msg_tag,
++			     buf, sizeof(buf));
++	if (rc != 0) {
++		LOG_WRN("mctp_message_tx (cc=%u) failed: %d", cc, rc);
++	}
++}
++
++static void pldm_dispatch_request(struct pldm_ctx *ctx, mctp_eid_t src,
++				  uint8_t msg_tag, const struct pldm_msg *req,
++				  size_t req_len)
++{
++	uint8_t pldm_type = req->hdr.type;
++	pldm_type_handler_fn fn;
++	uint8_t tx[PLDM_TX_BUF_SZ];
++	size_t resp_len = 0;
++	int rc;
++
++	if (pldm_type >= PLDM_MAX_TYPES) {
++		pldm_send_cc_resp(ctx, src, msg_tag, req,
++				  PLDM_ERROR_INVALID_PLDM_TYPE);
++		return;
++	}
++
++	fn = ctx->handlers[pldm_type];
++	if (fn == NULL) {
++		pldm_send_cc_resp(ctx, src, msg_tag, req,
++				  PLDM_ERROR_INVALID_PLDM_TYPE);
++		return;
++	}
++
++	tx[0] = PLDM_MCTP_MSG_TYPE;
++	rc = fn(ctx, src, req, req_len, pldm_msg_from(&tx[1]),
++		sizeof(tx) - 1U, &resp_len);
++	if (rc != 0) {
++		LOG_WRN("type %u handler rc=%d, sending ERROR", pldm_type, rc);
++		pldm_send_cc_resp(ctx, src, msg_tag, req, PLDM_ERROR);
++		return;
++	}
++
++	rc = mctp_message_tx(ctx->mctp, src, MCTP_MESSAGE_TO_SRC, msg_tag, tx,
++			     1U + resp_len);
++	if (rc != 0) {
++		LOG_WRN("mctp_message_tx (type %u) failed: %d", pldm_type, rc);
++	}
++}
++
++int pldm_register_type(struct pldm_ctx *ctx, uint8_t pldm_type,
++		       pldm_type_handler_fn fn)
++{
++	if (ctx == NULL || fn == NULL) {
++		return -EINVAL;
++	}
++	if (pldm_type >= PLDM_MAX_TYPES) {
++		return -EINVAL;
++	}
++	if (ctx->handlers[pldm_type] != NULL) {
++		return -EEXIST;
++	}
++	ctx->handlers[pldm_type] = fn;
++	return 0;
++}
++
++#endif /* CONFIG_PLDM_RESPONDER */
++
++#if defined(CONFIG_PLDM_REQUESTER)
++
++/*
++ * Locate a request slot matching (peer, type, command, instance_id). Called
++ * from the RX path so we know which requester to wake up. Caller holds
++ * ctx->req_lock.
++ */
++static struct pldm_request_slot *pldm_find_slot(struct pldm_ctx *ctx,
++						mctp_eid_t peer, uint8_t type,
++						uint8_t command,
++						uint8_t instance_id)
++{
++	for (size_t i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
++		struct pldm_request_slot *s = &ctx->slots[i];
++
++		if (s->used && s->peer_eid == peer && s->pldm_type == type &&
++		    s->command == command && s->instance_id == instance_id) {
++			return s;
++		}
++	}
++	return NULL;
++}
++
++static struct pldm_request_slot *pldm_alloc_slot(struct pldm_ctx *ctx,
++						 mctp_eid_t peer, uint8_t type,
++						 uint8_t command)
++{
++	static uint8_t rotor;
++	struct pldm_request_slot *s;
++
++	(void)k_sem_take(&ctx->req_slot_sem, K_FOREVER);
++	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
++
++	for (size_t i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
++		s = &ctx->slots[i];
++		if (!s->used) {
++			s->used = true;
++			s->instance_id = rotor++ & PLDM_INSTANCE_MAX;
++			s->pldm_type = type;
++			s->command = command;
++			s->peer_eid = peer;
++			s->resp_len = 0;
++			s->rc = 0;
++			k_sem_reset(&s->done);
++			k_mutex_unlock(&ctx->req_lock);
++			return s;
++		}
++	}
++
++	/* req_slot_sem count and slots[] usage must stay in sync. */
++	k_mutex_unlock(&ctx->req_lock);
++	k_sem_give(&ctx->req_slot_sem);
++	return NULL;
++}
++
++static void pldm_free_slot(struct pldm_ctx *ctx, struct pldm_request_slot *s)
++{
++	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
++	s->used = false;
++	k_mutex_unlock(&ctx->req_lock);
++	k_sem_give(&ctx->req_slot_sem);
++}
++
++int pldm_send_request_sync(struct pldm_ctx *ctx, mctp_eid_t peer_eid,
++			   uint8_t pldm_type, uint8_t command,
++			   const void *req_body, size_t req_len,
++			   void *resp_buf, size_t resp_size, size_t *resp_len)
++{
++	uint8_t tx[PLDM_TX_BUF_SZ];
++	struct pldm_msg *req;
++	struct pldm_header_info hdr = {
++		.msg_type = PLDM_REQUEST,
++		.pldm_type = pldm_type,
++		.command = command,
++	};
++	struct pldm_request_slot *slot;
++	int rc;
++
++	if (ctx == NULL || resp_buf == NULL || resp_len == NULL) {
++		return -EINVAL;
++	}
++	if (req_len + sizeof(struct pldm_msg_hdr) + 1U > sizeof(tx)) {
++		return -EMSGSIZE;
++	}
++
++	slot = pldm_alloc_slot(ctx, peer_eid, pldm_type, command);
++	if (slot == NULL) {
++		return -EBUSY;
++	}
++	hdr.instance = slot->instance_id;
++
++	tx[0] = PLDM_MCTP_MSG_TYPE;
++	req = pldm_msg_from(&tx[1]);
++	rc = pack_pldm_header(&hdr, &req->hdr);
++	if (rc != PLDM_SUCCESS) {
++		pldm_free_slot(ctx, slot);
++		return -EINVAL;
++	}
++	if (req_len > 0) {
++		memcpy(req->payload, req_body, req_len);
++	}
++
++	rc = mctp_message_tx(ctx->mctp, peer_eid, MCTP_MESSAGE_TO_DST, 0, tx,
++			     1U + sizeof(struct pldm_msg_hdr) + req_len);
++	if (rc != 0) {
++		LOG_WRN("mctp_message_tx failed: %d", rc);
++		pldm_free_slot(ctx, slot);
++		return -EIO;
++	}
++
++	rc = k_sem_take(&slot->done,
++			K_MSEC(CONFIG_PLDM_REQUESTER_TIMEOUT_MS));
++	if (rc != 0) {
++		LOG_WRN("timeout for type=%u cmd=%u", pldm_type, command);
++		pldm_free_slot(ctx, slot);
++		return -ETIMEDOUT;
++	}
++	if (slot->rc != 0) {
++		rc = slot->rc;
++		pldm_free_slot(ctx, slot);
++		return rc;
++	}
++
++	if (slot->resp_len > resp_size) {
++		pldm_free_slot(ctx, slot);
++		return -ENOSPC;
++	}
++
++	memcpy(resp_buf, slot->resp_buf, slot->resp_len);
++	*resp_len = slot->resp_len;
++	pldm_free_slot(ctx, slot);
++	return 0;
++}
++
++static void pldm_deliver_response(struct pldm_ctx *ctx, mctp_eid_t src,
++				  const struct pldm_msg *resp, size_t resp_len)
++{
++	struct pldm_request_slot *slot;
++
++	(void)k_mutex_lock(&ctx->req_lock, K_FOREVER);
++	slot = pldm_find_slot(ctx, src, resp->hdr.type, resp->hdr.command,
++			      resp->hdr.instance_id);
++	if (slot == NULL) {
++		LOG_WRN("orphan response type=%u cmd=%u inst=%u", resp->hdr.type,
++			resp->hdr.command, resp->hdr.instance_id);
++		k_mutex_unlock(&ctx->req_lock);
++		return;
++	}
++
++	if (resp_len > sizeof(slot->resp_buf)) {
++		slot->rc = -EMSGSIZE;
++		slot->resp_len = 0;
++	} else {
++		memcpy(slot->resp_buf, resp, resp_len);
++		slot->resp_len = resp_len;
++	}
++	k_mutex_unlock(&ctx->req_lock);
++	k_sem_give(&slot->done);
++}
++
++#endif /* CONFIG_PLDM_REQUESTER */
++
++void pldm_ctx_rx(uint8_t src_eid, bool tag_owner, uint8_t msg_tag, void *data,
++		 void *msg, size_t len)
++{
++	struct pldm_ctx *ctx = data;
++	const uint8_t *buf = msg;
++	const struct pldm_msg *pmsg;
++
++	ARG_UNUSED(tag_owner);
++
++	if (ctx == NULL || buf == NULL) {
++		return;
++	}
++	if (len < 1U + sizeof(struct pldm_msg_hdr)) {
++		LOG_WRN("short MCTP payload: %zu", len);
++		return;
++	}
++	if (buf[0] != PLDM_MCTP_MSG_TYPE) {
++		/* Not our message type; ignore. */
++		return;
++	}
++
++	pmsg = (const struct pldm_msg *)&buf[1];
++	if (pmsg->hdr.request) {
++#if defined(CONFIG_PLDM_RESPONDER)
++		pldm_dispatch_request(ctx, src_eid, msg_tag, pmsg, len - 1U);
++#else
++		ARG_UNUSED(msg_tag);
++		LOG_WRN("responder disabled, dropping PLDM request from EID 0x%02x",
++			src_eid);
++#endif
++	} else {
++#if defined(CONFIG_PLDM_REQUESTER)
++		pldm_deliver_response(ctx, src_eid, pmsg, len - 1U);
++#else
++		LOG_WRN("requester disabled, dropping PLDM response");
++#endif
++	}
++}
++
++int pldm_ctx_init(struct pldm_ctx *ctx, struct mctp *mctp, mctp_eid_t eid)
++{
++	int rc;
++
++	if (ctx == NULL || mctp == NULL) {
++		return -EINVAL;
++	}
++	memset(ctx, 0, sizeof(*ctx));
++	ctx->mctp = mctp;
++	ctx->local_eid = eid;
++
++#if defined(CONFIG_PLDM_REQUESTER)
++	k_mutex_init(&ctx->req_lock);
++	k_sem_init(&ctx->req_slot_sem, ARRAY_SIZE(ctx->slots),
++		   ARRAY_SIZE(ctx->slots));
++	for (size_t i = 0; i < ARRAY_SIZE(ctx->slots); i++) {
++		k_sem_init(&ctx->slots[i].done, 0, 1);
++	}
++#endif
++
++	rc = mctp_set_rx_all(mctp, pldm_ctx_rx, ctx);
++	if (rc != 0) {
++		return rc;
++	}
++	return 0;
++}
+diff --git a/subsys/pmci/pldm/pldm_base.c b/subsys/pmci/pldm/pldm_base.c
+new file mode 100644
+index 00000000000..9fdc3ecf93b
+--- /dev/null
++++ b/subsys/pmci/pldm/pldm_base.c
+@@ -0,0 +1,399 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM Type 0 (Messaging Control and Discovery, DSP0240 §9).
++ *
++ * Implements the responder side of:
++ *   SetTID (0x01), GetTID (0x02), GetPLDMVersion (0x03),
++ *   GetPLDMTypes (0x04), GetPLDMCommands (0x05)
++ * and matching requester helpers for the same commands.
++ *
++ * All encode/decode is delegated to libpldm.
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/logging/log.h>
++
++#include <libpldm/base.h>
++#include <libpldm/pldm_types.h>
++
++#include <zephyr/pmci/pldm/pldm.h>
++#include <zephyr/pmci/pldm/pldm_base.h>
++
++LOG_MODULE_DECLARE(pldm, CONFIG_PLDM_LOG_LEVEL);
++
++/*
++ * Advertised Terminus ID. Global rather than per-context because Type 0
++ * describes the terminus, of which there is exactly one per firmware image.
++ */
++static uint8_t pldm_base_tid = CONFIG_PLDM_BASE_INITIAL_TID;
++
++/* Only PLDM_BASE (0) is supported so far. Bit N in supported_types[N/8]. */
++static const bitfield8_t base_supported_types[8] = {
++	{ .byte = (1U << PLDM_BASE) },
++	{ 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 }, { 0 },
++};
++
++/* PLDM base commands the responder supports. */
++static bitfield8_t base_supported_commands[32];
++
++/* DSP0240 §6 mandates version 1.1.0 for the base type. */
++static const ver32_t base_version = {
++	.major = 0xf1,	/* 1 */
++	.minor = 0xf1,	/* .1 */
++	.update = 0xf0, /* .0 */
++	.alpha = 0x00,
++};
++
++uint8_t pldm_base_get_tid(void)
++{
++	return pldm_base_tid;
++}
++
++void pldm_base_set_tid(uint8_t tid)
++{
++	pldm_base_tid = tid;
++}
++
++static void base_cmds_populate(void)
++{
++	static bool inited;
++
++	if (inited) {
++		return;
++	}
++	memset(base_supported_commands, 0, sizeof(base_supported_commands));
++	/* Byte N covers commands [N*8 .. N*8+7]. Commands 1..5 sit in byte 0. */
++	base_supported_commands[0].byte =
++		(1U << PLDM_SET_TID) | (1U << PLDM_GET_TID) |
++		(1U << PLDM_GET_PLDM_VERSION) | (1U << PLDM_GET_PLDM_TYPES) |
++		(1U << PLDM_GET_PLDM_COMMANDS);
++	inited = true;
++}
++
++/* GetTID */
++static int handle_get_tid(const struct pldm_msg *req, struct pldm_msg *resp,
++			  size_t resp_size, size_t *resp_len)
++{
++	int rc;
++
++	if (resp_size < sizeof(struct pldm_msg_hdr) + PLDM_GET_TID_RESP_BYTES) {
++		return -ENOSPC;
++	}
++	rc = encode_get_tid_resp(req->hdr.instance_id, PLDM_SUCCESS,
++				 pldm_base_tid, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + PLDM_GET_TID_RESP_BYTES;
++	return 0;
++}
++
++/* SetTID */
++static int handle_set_tid(const struct pldm_msg *req, size_t req_len,
++			  struct pldm_msg *resp, size_t resp_size,
++			  size_t *resp_len)
++{
++	uint8_t new_tid;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) + PLDM_SET_TID_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) + PLDM_SET_TID_RESP_BYTES) {
++		return -ENOSPC;
++	}
++
++	rc = decode_set_tid_req(req,
++				req_len - sizeof(struct pldm_msg_hdr),
++				&new_tid);
++	if (rc != 0) {
++		LOG_WRN("decode_set_tid_req rc=%d", rc);
++		return -EBADMSG;
++	}
++
++	pldm_base_tid = new_tid;
++	/* SetTID response is CC-only. */
++	rc = encode_cc_only_resp(req->hdr.instance_id, PLDM_BASE, PLDM_SET_TID,
++				 PLDM_SUCCESS, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + PLDM_SET_TID_RESP_BYTES;
++	return 0;
++}
++
++/* GetPLDMVersion */
++static int handle_get_version(const struct pldm_msg *req, size_t req_len,
++			      struct pldm_msg *resp, size_t resp_size,
++			      size_t *resp_len)
++{
++	uint32_t xfer_handle;
++	uint8_t xfer_opflag;
++	uint8_t type;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) + PLDM_GET_VERSION_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) + PLDM_GET_VERSION_RESP_BYTES) {
++		return -ENOSPC;
++	}
++
++	rc = decode_get_version_req(req,
++				    req_len - sizeof(struct pldm_msg_hdr),
++				    &xfer_handle, &xfer_opflag, &type);
++	if (rc != PLDM_SUCCESS) {
++		LOG_WRN("decode_get_version_req rc=%d", rc);
++		return -EBADMSG;
++	}
++
++	if (type != PLDM_BASE) {
++		rc = encode_cc_only_resp(
++			req->hdr.instance_id, PLDM_BASE, PLDM_GET_PLDM_VERSION,
++			PLDM_GET_PLDM_VERSION_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
++			resp);
++		*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++		return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++	}
++
++	rc = encode_get_version_resp(req->hdr.instance_id, PLDM_SUCCESS,
++				     0 /* next handle */,
++				     PLDM_START_AND_END, &base_version,
++				     sizeof(base_version), resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + PLDM_GET_VERSION_RESP_BYTES;
++	return 0;
++}
++
++/* GetPLDMTypes */
++static int handle_get_types(const struct pldm_msg *req, struct pldm_msg *resp,
++			    size_t resp_size, size_t *resp_len)
++{
++	struct pldm_base_get_pldm_types_resp r = { 0 };
++	size_t out_len = resp_size;
++	int rc;
++
++	r.completion_code = PLDM_SUCCESS;
++	memcpy(r.pldm_types, base_supported_types, sizeof(r.pldm_types));
++
++	rc = encode_pldm_base_get_pldm_types_resp(req->hdr.instance_id, &r, resp,
++						  &out_len);
++	if (rc != 0) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + out_len;
++	return 0;
++}
++
++/* GetPLDMCommands */
++static int handle_get_commands(const struct pldm_msg *req, size_t req_len,
++			       struct pldm_msg *resp, size_t resp_size,
++			       size_t *resp_len)
++{
++	uint8_t type;
++	ver32_t ver;
++	int rc;
++
++	if (req_len < sizeof(struct pldm_msg_hdr) + PLDM_GET_COMMANDS_REQ_BYTES) {
++		return -EBADMSG;
++	}
++	if (resp_size < sizeof(struct pldm_msg_hdr) + PLDM_GET_COMMANDS_RESP_BYTES) {
++		return -ENOSPC;
++	}
++
++	rc = decode_get_commands_req(req,
++				     req_len - sizeof(struct pldm_msg_hdr),
++				     &type, &ver);
++	if (rc != PLDM_SUCCESS) {
++		return -EBADMSG;
++	}
++	if (type != PLDM_BASE) {
++		rc = encode_cc_only_resp(
++			req->hdr.instance_id, PLDM_BASE, PLDM_GET_PLDM_COMMANDS,
++			PLDM_GET_PLDM_COMMANDS_INVALID_PLDM_TYPE_IN_REQUEST_DATA,
++			resp);
++		*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++		return (rc == PLDM_SUCCESS) ? 0 : -EIO;
++	}
++
++	base_cmds_populate();
++	rc = encode_get_commands_resp(req->hdr.instance_id, PLDM_SUCCESS,
++				      base_supported_commands, resp);
++	if (rc != PLDM_SUCCESS) {
++		return -EIO;
++	}
++	*resp_len = sizeof(struct pldm_msg_hdr) + PLDM_GET_COMMANDS_RESP_BYTES;
++	return 0;
++}
++
++/*
++ * Top-level Type 0 dispatch. Called by the PLDM core once it has decided the
++ * request targets PLDM_BASE.
++ */
++static int pldm_base_handler(struct pldm_ctx *ctx, uint8_t src_eid,
++			     const struct pldm_msg *req, size_t req_len,
++			     struct pldm_msg *resp, size_t resp_size,
++			     size_t *resp_len)
++{
++	ARG_UNUSED(ctx);
++	ARG_UNUSED(src_eid);
++
++	base_cmds_populate();
++
++	switch (req->hdr.command) {
++	case PLDM_GET_TID:
++		return handle_get_tid(req, resp, resp_size, resp_len);
++	case PLDM_SET_TID:
++		return handle_set_tid(req, req_len, resp, resp_size, resp_len);
++	case PLDM_GET_PLDM_VERSION:
++		return handle_get_version(req, req_len, resp, resp_size,
++					  resp_len);
++	case PLDM_GET_PLDM_TYPES:
++		return handle_get_types(req, resp, resp_size, resp_len);
++	case PLDM_GET_PLDM_COMMANDS:
++		return handle_get_commands(req, req_len, resp, resp_size,
++					   resp_len);
++	default:
++		if (resp_size >= sizeof(struct pldm_msg_hdr) + 1U) {
++			(void)encode_cc_only_resp(req->hdr.instance_id, PLDM_BASE,
++						  req->hdr.command,
++						  PLDM_ERROR_UNSUPPORTED_PLDM_CMD,
++						  resp);
++			*resp_len = sizeof(struct pldm_msg_hdr) + 1U;
++			return 0;
++		}
++		return -ENOTSUP;
++	}
++}
++
++int pldm_base_responder_register(struct pldm_ctx *ctx)
++{
++#if defined(CONFIG_PLDM_RESPONDER)
++	base_cmds_populate();
++	return pldm_register_type(ctx, PLDM_BASE, pldm_base_handler);
++#else
++	ARG_UNUSED(ctx);
++	return -ENOSYS;
++#endif
++}
++
++#if defined(CONFIG_PLDM_REQUESTER)
++
++int pldm_base_get_tid_sync(struct pldm_ctx *ctx, mctp_eid_t peer, uint8_t *tid)
++{
++	uint8_t resp_buf[sizeof(struct pldm_msg_hdr) + PLDM_GET_TID_RESP_BYTES];
++	size_t resp_len = 0;
++	uint8_t cc;
++	int rc;
++
++	if (tid == NULL) {
++		return -EINVAL;
++	}
++
++	rc = pldm_send_request_sync(ctx, peer, PLDM_BASE, PLDM_GET_TID, NULL, 0,
++				    resp_buf, sizeof(resp_buf), &resp_len);
++	if (rc != 0) {
++		return rc;
++	}
++	if (resp_len < sizeof(struct pldm_msg_hdr) + PLDM_GET_TID_RESP_BYTES) {
++		return -EBADMSG;
++	}
++
++	rc = decode_get_tid_resp((const struct pldm_msg *)resp_buf,
++				 resp_len - sizeof(struct pldm_msg_hdr), &cc,
++				 tid);
++	if (rc != PLDM_SUCCESS || cc != PLDM_SUCCESS) {
++		return -EPROTO;
++	}
++	return 0;
++}
++
++int pldm_base_get_types_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
++			     uint8_t types[8])
++{
++	uint8_t resp_buf[sizeof(struct pldm_msg_hdr) +
++			 PLDM_BASE_GET_PLDM_TYPES_RESP_BYTES];
++	size_t resp_len = 0;
++	struct pldm_base_get_pldm_types_resp decoded;
++	int rc;
++
++	if (types == NULL) {
++		return -EINVAL;
++	}
++
++	rc = pldm_send_request_sync(ctx, peer, PLDM_BASE, PLDM_GET_PLDM_TYPES,
++				    NULL, 0, resp_buf, sizeof(resp_buf),
++				    &resp_len);
++	if (rc != 0) {
++		return rc;
++	}
++	if (resp_len < sizeof(struct pldm_msg_hdr) +
++			       PLDM_BASE_GET_PLDM_TYPES_RESP_BYTES) {
++		return -EBADMSG;
++	}
++
++	rc = decode_pldm_base_get_pldm_types_resp(
++		(const struct pldm_msg *)resp_buf,
++		resp_len - sizeof(struct pldm_msg_hdr), &decoded);
++	if (rc != 0 || decoded.completion_code != PLDM_SUCCESS) {
++		return -EPROTO;
++	}
++	for (size_t i = 0; i < 8; i++) {
++		types[i] = decoded.pldm_types[i].byte;
++	}
++	return 0;
++}
++
++int pldm_base_get_version_sync(struct pldm_ctx *ctx, mctp_eid_t peer,
++			       uint8_t pldm_type, ver32_t *version)
++{
++	uint8_t req_body[PLDM_GET_VERSION_REQ_BYTES];
++	uint8_t resp_buf[sizeof(struct pldm_msg_hdr) + PLDM_GET_VERSION_RESP_BYTES];
++	size_t resp_len = 0;
++	uint8_t cc;
++	uint32_t next_handle;
++	uint8_t xfer_flag;
++	int rc;
++
++	if (version == NULL) {
++		return -EINVAL;
++	}
++
++	/*
++	 * DSP0240 §9.4: GetPLDMVersion request body is
++	 *   uint32 DataTransferHandle (0 for firstpart)
++	 *   uint8  TransferOperationFlag
++	 *   uint8  Type
++	 */
++	memset(req_body, 0, sizeof(req_body));
++	req_body[4] = PLDM_GET_FIRSTPART;
++	req_body[5] = pldm_type;
++
++	rc = pldm_send_request_sync(ctx, peer, PLDM_BASE, PLDM_GET_PLDM_VERSION,
++				    req_body, sizeof(req_body), resp_buf,
++				    sizeof(resp_buf), &resp_len);
++	if (rc != 0) {
++		return rc;
++	}
++	if (resp_len < sizeof(struct pldm_msg_hdr) + PLDM_GET_VERSION_RESP_BYTES) {
++		return -EBADMSG;
++	}
++
++	rc = decode_get_version_resp((const struct pldm_msg *)resp_buf,
++				     resp_len - sizeof(struct pldm_msg_hdr),
++				     &cc, &next_handle, &xfer_flag, version);
++	if (rc != PLDM_SUCCESS || cc != PLDM_SUCCESS) {
++		return -EPROTO;
++	}
++	return 0;
++}
++
++#endif /* CONFIG_PLDM_REQUESTER */
+diff --git a/west.yml b/west.yml
+index f62791e5b0c..d5f5a7199a5 100644
+--- a/west.yml
++++ b/west.yml
+@@ -293,6 +293,10 @@ manifest:
+     - name: libmctp
+       revision: b97860e78998551af99931ece149eeffc538bdb1
+       path: modules/lib/libmctp
++    - name: libpldm
++      url: https://github.com/openbmc/libpldm
++      revision: df0a2219c0f3a3f6aeeed2b9f3dabbe37911e36e
++      path: modules/lib/libpldm
+     - name: libmetal
+       revision: 91d38634d1882f0a2151966f8c5c230ce1c0de7b
+       path: modules/hal/libmetal
+-- 
+2.25.1
+

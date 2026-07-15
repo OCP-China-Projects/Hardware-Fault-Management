@@ -1,0 +1,444 @@
+From 6f6fb14daddcb58f0e37e9d5bdad0c69ee1f906f Mon Sep 17 00:00:00 2001
+From: HFM <hfm@ocp>
+Date: Mon, 6 Jul 2026 18:02:28 +0800
+Subject: [PATCH zephyr] subsys/pmci/mctp: add MCTP-over-I3C binding (DSP0233
+ v1.0)
+
+Add a new libmctp binding that transports MCTP frames over Zephyr's I3C
+controller API. The Zephyr guest is the I3C primary controller; a peer
+target signals a pending frame with an IBI carrying MDB = 0xAE, and the
+controller drains the frame through a private I3C read. Outgoing packets
+are written back with a private I3C write. An 8-bit PEC (SMBus CRC-8,
+poly 0x07, seed 0x00) is appended to and verified on every frame.
+
+The binding is opt-in via CONFIG_MCTP_I3C, requires I3C_CONTROLLER, and
+selects I3C_USE_IBI. CONFIG_MCTP_I3C_MTU defaults to 69 B per DSP0233
+v1.0 s6.1.
+
+Instantiate with:
+
+    static struct i3c_device_desc peer = { .bus = ..., .pid = ..., };
+    MCTP_I3C_DT_DEFINE(mctp_i3c, DEVICE_DT_GET(DT_NODELABEL(i3c0)), &peer);
+
+Signed-off-by: HFM <hfm@ocp>
+---
+ include/zephyr/pmci/mctp/mctp_i3c.h | 108 ++++++++++++
+ subsys/pmci/mctp/CMakeLists.txt     |   1 +
+ subsys/pmci/mctp/Kconfig            |  21 +++
+ subsys/pmci/mctp/mctp_i3c.c         | 246 ++++++++++++++++++++++++++++
+ 4 files changed, 376 insertions(+)
+ create mode 100644 include/zephyr/pmci/mctp/mctp_i3c.h
+ create mode 100644 subsys/pmci/mctp/mctp_i3c.c
+
+diff --git a/include/zephyr/pmci/mctp/mctp_i3c.h b/include/zephyr/pmci/mctp/mctp_i3c.h
+new file mode 100644
+index 00000000000..5bd6db4f920
+--- /dev/null
++++ b/include/zephyr/pmci/mctp/mctp_i3c.h
+@@ -0,0 +1,108 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_MCTP_I3C_H_
++#define ZEPHYR_MCTP_I3C_H_
++
++#include <stdint.h>
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/drivers/i3c.h>
++#include <libmctp.h>
++
++/**
++ * @brief DSP0233 v1.0 — MCTP over I3C transport binding.
++ *
++ * The Zephyr guest acts as the primary I3C controller; the peer target
++ * signals a pending message via IBI (MDB = 0xAE) and the controller reads
++ * the frame back through a private I3C read.
++ */
++
++/** DSP0233 §6.1 — max frame payload including MCTP header. */
++#define MCTP_I3C_MTU CONFIG_MCTP_I3C_MTU
++
++/** DSP0233 §6.2 — Device Class Register value advertising an MCTP endpoint. */
++#define MCTP_I3C_DCR 0xCC
++
++/** DSP0233 §6.4 — Mandatory Data Byte accompanying the IBI. */
++#define MCTP_I3C_IBI_MDB 0xAE
++
++/** @cond INTERNAL_HIDDEN */
++struct mctp_binding_i3c;
++/** INTERNAL_HIDDEN @endcond */
++
++/**
++ * @brief MCTP I3C binding descriptor.
++ *
++ * Wraps the generic libmctp binding with I3C-specific state: the controller
++ * device, the peer target descriptor, RX/TX staging buffers and the RX
++ * work item that runs the private read out of interrupt context.
++ */
++struct mctp_binding_i3c {
++	/** @cond INTERNAL_HIDDEN */
++	struct mctp_binding binding;
++
++	/** I3C controller device this binding operates on. */
++	const struct device *i3c_dev;
++
++	/** Peer target device descriptor (the MCTP endpoint). */
++	struct i3c_device_desc *target;
++
++	/** Staging buffer used to build the outgoing frame (MCTP hdr + payload + PEC). */
++	uint8_t tx_buf[MCTP_I3C_MTU + 1];
++
++	/** Staging buffer used to receive the incoming frame. */
++	uint8_t rx_buf[MCTP_I3C_MTU + 1];
++
++	/** Length of the last read into @c rx_buf. */
++	uint8_t rx_len;
++
++	/** Deferred work handling the private read after an IBI. */
++	struct k_work rx_work;
++
++	/** Result of the last transmission. */
++	int tx_res;
++
++	/** Result of the last reception. */
++	int rx_res;
++	/** INTERNAL_HIDDEN @endcond */
++};
++
++/** @cond INTERNAL_HIDDEN */
++int  mctp_i3c_start(struct mctp_binding *binding);
++int  mctp_i3c_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt);
++int  mctp_i3c_ibi_cb(struct i3c_device_desc *target,
++		     struct i3c_ibi_payload *payload);
++/** INTERNAL_HIDDEN @endcond */
++
++/**
++ * @brief Statically define an MCTP I3C bus binding.
++ *
++ * @param _name  Symbolic name of the binding variable.
++ * @param _i3c   Pointer to the I3C controller @c device.
++ * @param _tgt   Pointer to a pre-populated @ref i3c_device_desc for the peer
++ *               MCTP endpoint. Its @c ibi_cb field is overwritten by
++ *               @ref mctp_i3c_start.
++ */
++#define MCTP_I3C_DT_DEFINE(_name, _i3c, _tgt)                                      \
++	struct mctp_binding_i3c _name = {                                          \
++		.binding = {                                                       \
++			.name = STRINGIFY(_name),                                  \
++			.version = 1,                                              \
++			.pkt_size = MCTP_PACKET_SIZE(MCTP_BTU),                    \
++			.pkt_header = 0,                                           \
++			.pkt_trailer = 0,                                          \
++			.start = mctp_i3c_start,                                   \
++			.tx = mctp_i3c_tx,                                         \
++		},                                                                 \
++		.i3c_dev = (_i3c),                                                 \
++		.target = (_tgt),                                                  \
++		.rx_len = 0,                                                       \
++		.tx_res = 0,                                                       \
++		.rx_res = 0,                                                       \
++	}
++
++#endif /* ZEPHYR_MCTP_I3C_H_ */
+diff --git a/subsys/pmci/mctp/CMakeLists.txt b/subsys/pmci/mctp/CMakeLists.txt
+index 43e77180e80..e804f607807 100644
+--- a/subsys/pmci/mctp/CMakeLists.txt
++++ b/subsys/pmci/mctp/CMakeLists.txt
+@@ -3,5 +3,6 @@ zephyr_library_sources(mctp_memory.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_UART mctp_uart.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_CONTROLLER mctp_i2c_gpio_controller.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_TARGET mctp_i2c_gpio_target.c)
++zephyr_library_sources_ifdef(CONFIG_MCTP_I3C mctp_i3c.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_USB mctp_usb.c)
+ zephyr_linker_sources_ifdef(CONFIG_MCTP_USB SECTIONS mctp_usb.ld)
+diff --git a/subsys/pmci/mctp/Kconfig b/subsys/pmci/mctp/Kconfig
+index 1f5c8c21572..c6b68fa002a 100644
+--- a/subsys/pmci/mctp/Kconfig
++++ b/subsys/pmci/mctp/Kconfig
+@@ -43,6 +43,27 @@ config MCTP_I2C_GPIO_TARGET
+ 	  Build the MCTP I2C+GPIO target binding to use MCTP over Zephyr's I2C target
+ 	  interface and GPIO to signal writes to the bus controller.
+ 
++config MCTP_I3C
++	bool "MCTP I3C Binding"
++	depends on I3C
++	depends on I3C_CONTROLLER
++	select I3C_USE_IBI
++	help
++	  Build the MCTP I3C binding (DSP0233 v1.0). The Zephyr guest acts as
++	  the I3C primary controller; peers signal pending frames via IBI
++	  (MDB = 0xAE) and the controller drains them with a private read.
++
++config MCTP_I3C_MTU
++	int "Maximum I3C MCTP frame body size (bytes)"
++	depends on MCTP_I3C
++	range 32 255
++	default 69
++	help
++	  Maximum size, in bytes, of an MCTP-over-I3C frame body (MCTP header
++	  plus payload, excluding the trailing PEC byte). DSP0233 v1.0 §6.1
++	  specifies 69 bytes (4 B MCTP header + 64 B baseline transmission unit
++	  + 1 B reserved) as the default.
++
+ config MCTP_USB
+ 	bool "MCTP USB Binding"
+ 	depends on USB_DEVICE_STACK_NEXT
+diff --git a/subsys/pmci/mctp/mctp_i3c.c b/subsys/pmci/mctp/mctp_i3c.c
+new file mode 100644
+index 00000000000..cb85cd9120a
+--- /dev/null
++++ b/subsys/pmci/mctp/mctp_i3c.c
+@@ -0,0 +1,246 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * DSP0233 v1.0 — MCTP over I3C transport binding for Zephyr.
++ *
++ * The binding lives on top of Zephyr's I3C controller API:
++ *   - TX  : private I3C write of [MCTP header || payload || PEC].
++ *   - RX  : an IBI with MDB = 0xAE from the peer target signals a pending
++ *           frame; the controller schedules a work item that issues a private
++ *           I3C read to drain the frame and hands the packet up via
++ *           mctp_bus_rx().
++ *
++ * The 8-bit PEC follows SMBus (poly 0x07, seed 0x00) computed over the
++ * MCTP header + payload as required by DSP0233 §6.3.
++ */
++
++#include <string.h>
++#include <zephyr/kernel.h>
++#include <zephyr/sys/__assert.h>
++#include <zephyr/drivers/i3c.h>
++#include <zephyr/pmci/mctp/mctp_i3c.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(mctp_i3c, CONFIG_MCTP_LOG_LEVEL);
++
++static inline struct mctp_binding_i3c *binding_to_i3c(struct mctp_binding *b)
++{
++	return CONTAINER_OF(b, struct mctp_binding_i3c, binding);
++}
++
++/*
++ * SMBus/I3C PEC (CRC-8, poly 0x07, seed 0x00). DSP0233 §6.3 refers to it as
++ * "the MCTP-over-SMBus PEC used unchanged over I3C".
++ */
++static uint8_t mctp_i3c_pec(const uint8_t *buf, size_t len)
++{
++	uint8_t crc = 0;
++
++	for (size_t i = 0; i < len; i++) {
++		crc ^= buf[i];
++		for (int b = 0; b < 8; b++) {
++			crc = (crc & 0x80) ? (uint8_t)((crc << 1) ^ 0x07)
++					   : (uint8_t)(crc << 1);
++		}
++	}
++	return crc;
++}
++
++/*
++ * Perform a single private I3C read of at most MCTP_I3C_MTU + 1 bytes into
++ * the RX staging buffer. Returns bytes actually read on success, negative
++ * errno otherwise.
++ */
++static int mctp_i3c_do_read(struct mctp_binding_i3c *b3)
++{
++	struct i3c_msg msg = {
++		.buf = b3->rx_buf,
++		.len = sizeof(b3->rx_buf),
++		.flags = I3C_MSG_READ | I3C_MSG_STOP,
++	};
++	int ret;
++
++	if (b3->target == NULL) {
++		return -ENODEV;
++	}
++
++	ret = i3c_transfer(b3->target, &msg, 1);
++	if (ret < 0) {
++		LOG_ERR("i3c_transfer(read) failed: %d", ret);
++		return ret;
++	}
++
++	return (int)msg.num_xfer;
++}
++
++/*
++ * Deferred RX handler: runs on the system workqueue after the IBI callback
++ * has scheduled it. Drains the frame, verifies the PEC and hands the packet
++ * to the MCTP core.
++ */
++static void mctp_i3c_rx_work_handler(struct k_work *work)
++{
++	struct mctp_binding_i3c *b3 =
++		CONTAINER_OF(work, struct mctp_binding_i3c, rx_work);
++	struct mctp_pktbuf *pkt;
++	int len;
++	uint8_t expected_pec;
++
++	len = mctp_i3c_do_read(b3);
++	if (len < 0) {
++		b3->rx_res = len;
++		return;
++	}
++	b3->rx_len = (uint8_t)len;
++
++	/* Frame must contain at least an MCTP header and a trailing PEC. */
++	if (len < (int)(sizeof(struct mctp_hdr) + 1)) {
++		LOG_WRN("i3c rx: short frame (%d bytes), dropping", len);
++		b3->rx_res = -EBADMSG;
++		return;
++	}
++
++	expected_pec = mctp_i3c_pec(b3->rx_buf, len - 1);
++	if (b3->rx_buf[len - 1] != expected_pec) {
++		LOG_WRN("i3c rx: PEC mismatch got=0x%02x exp=0x%02x",
++			b3->rx_buf[len - 1], expected_pec);
++		b3->rx_res = -EBADMSG;
++		return;
++	}
++
++	/* Payload = frame minus PEC. */
++	pkt = mctp_pktbuf_alloc(&b3->binding, 0);
++	if (pkt == NULL) {
++		LOG_ERR("i3c rx: pktbuf alloc failed");
++		b3->rx_res = -ENOMEM;
++		return;
++	}
++
++	if (mctp_pktbuf_push(pkt, b3->rx_buf, len - 1) != 0) {
++		LOG_ERR("i3c rx: pktbuf push failed");
++		mctp_pktbuf_free(pkt);
++		b3->rx_res = -ENOMEM;
++		return;
++	}
++
++	b3->rx_res = 0;
++	mctp_bus_rx(&b3->binding, pkt);
++}
++
++/*
++ * IBI callback registered on the peer target descriptor. Runs in the I3C
++ * controller's IBI context — schedule a work item to do the actual read.
++ *
++ * DSP0233 §6.4: the peer must accompany the IBI with MDB = 0xAE.
++ */
++int mctp_i3c_ibi_cb(struct i3c_device_desc *target,
++		    struct i3c_ibi_payload *payload)
++{
++	struct mctp_binding_i3c *b3 = target->controller_priv;
++
++	if (b3 == NULL) {
++		return -ENODEV;
++	}
++
++	if (payload != NULL && payload->payload_len > 0 &&
++	    payload->payload[0] != MCTP_I3C_IBI_MDB) {
++		LOG_WRN("i3c ibi: unexpected MDB 0x%02x (want 0x%02x)",
++			payload->payload[0], MCTP_I3C_IBI_MDB);
++		/* NACK — DSP0233 mandates MDB=0xAE. */
++		return -EINVAL;
++	}
++
++	(void)k_work_submit(&b3->rx_work);
++	return 0;
++}
++
++/*
++ * Bring the binding up: initialise the RX work item, install the IBI
++ * callback on the peer target descriptor and enable IBI. libmctp is told
++ * TX is available so it can start pumping packets.
++ */
++int mctp_i3c_start(struct mctp_binding *binding)
++{
++	struct mctp_binding_i3c *b3 = binding_to_i3c(binding);
++	int ret;
++
++	if (b3->i3c_dev == NULL || !device_is_ready(b3->i3c_dev)) {
++		LOG_ERR("i3c controller not ready");
++		return -ENODEV;
++	}
++	if (b3->target == NULL) {
++		LOG_ERR("i3c target descriptor missing");
++		return -ENODEV;
++	}
++
++	k_work_init(&b3->rx_work, mctp_i3c_rx_work_handler);
++
++	/* Wire the target descriptor back to us so the IBI callback can find
++	 * the binding without a global.
++	 */
++	b3->target->controller_priv = b3;
++
++#if defined(CONFIG_I3C_USE_IBI)
++	b3->target->ibi_cb = mctp_i3c_ibi_cb;
++
++	ret = i3c_ibi_enable(b3->target);
++	if (ret != 0 && ret != -ENOSYS) {
++		LOG_ERR("i3c_ibi_enable failed: %d", ret);
++		return ret;
++	}
++#else
++	ret = 0;
++	LOG_WRN("CONFIG_I3C_USE_IBI disabled — RX will not work");
++#endif
++
++	mctp_binding_set_tx_enabled(binding, true);
++	return 0;
++}
++
++/*
++ * Transmit one MCTP packet over I3C. Frame layout:
++ *   [ MCTP header (4B) | payload (N) | PEC (1B) ]
++ *
++ * libmctp splits large messages into pkt_size-sized packets before calling
++ * us, so pkt is guaranteed to fit into MCTP_I3C_MTU minus the PEC byte.
++ */
++int mctp_i3c_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt)
++{
++	struct mctp_binding_i3c *b3 = binding_to_i3c(binding);
++	size_t body_len;
++	uint8_t pec;
++	struct i3c_msg msg;
++	int ret;
++
++	if (b3->target == NULL) {
++		return -ENODEV;
++	}
++
++	body_len = mctp_pktbuf_size(pkt);
++	if (body_len == 0 || body_len > MCTP_I3C_MTU) {
++		LOG_ERR("i3c tx: bad body len %zu", body_len);
++		return -EMSGSIZE;
++	}
++
++	memcpy(b3->tx_buf, mctp_pktbuf_hdr(pkt), body_len);
++	pec = mctp_i3c_pec(b3->tx_buf, body_len);
++	b3->tx_buf[body_len] = pec;
++
++	msg = (struct i3c_msg){
++		.buf = b3->tx_buf,
++		.len = (uint32_t)(body_len + 1U),
++		.flags = I3C_MSG_WRITE | I3C_MSG_STOP,
++	};
++
++	ret = i3c_transfer(b3->target, &msg, 1);
++	if (ret < 0) {
++		LOG_ERR("i3c_transfer(write) failed: %d", ret);
++		b3->tx_res = ret;
++		return ret;
++	}
++
++	b3->tx_res = 0;
++	return 0;
++}
+-- 
+2.25.1
+

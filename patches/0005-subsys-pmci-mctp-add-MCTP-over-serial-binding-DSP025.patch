@@ -1,0 +1,679 @@
+From b18249d036cafb18210254291e4d18bc99023d42 Mon Sep 17 00:00:00 2001
+From: HFM <hfm@example.com>
+Date: Wed, 8 Jul 2026 14:19:06 +0800
+Subject: [PATCH] subsys/pmci/mctp: add MCTP-over-serial binding (DSP0253),
+ interrupt-driven
+
+Add a DMTF DSP0253 MCTP-over-serial transport binding driven over the
+interrupt-driven UART API (uart_fifo_read / uart_fifo_fill), plus a PLDM
+Type 0 sample that bridges a Zephyr QEMU instance to an OpenBMC QEMU
+instance over a host unix socket.
+
+The wire framing (0x7e flags, 0x7d byte stuffing, RFC1662 FCS-16) is
+identical to the existing async mctp_uart binding, but the I/O path uses
+only the interrupt-driven UART API, so it runs on controllers without
+async/DMA support -- notably the SiFive UART on QEMU's sifive_u machine,
+which is the practical inter-QEMU MCTP path today.
+
+Notes on the SiFive UART: irq_is_pending()/irq_tx_ready() report the raw
+hardware condition (TXWM stays asserted while the TX FIFO is below the
+watermark) and irq_update() always returns 1, so the ISR runs a single
+pass and gates the TX FIFO behind a tx_active flag rather than looping on
+irq_is_pending().
+
+The serial_bridge sample registers the PLDM Type 0 responder as EID 18
+and answers GetTID / GetPLDMTypes / GetPLDMVersion from the BMC (EID 8).
+The board overlay redirects zephyr,sram from l2lim to ram0 (DDR) so the
+image boots on QEMU's sifive_u model, which does not implement l2lim.
+
+Verified end-to-end against a host DSP0253/PLDM simulator over a
+-serial unix: socket:
+
+  GetTID         -> cc=0x00 tid=1
+  GetPLDMTypes   -> cc=0x00 type0 supported
+  GetPLDMVersion -> cc=0x00 1.0.0
+---
+ include/zephyr/pmci/mctp/mctp_serial.h        |  94 ++++++
+ .../pmci/pldm/serial_bridge/CMakeLists.txt    |   9 +
+ .../boards/hifive_unleashed_fu540_u54.overlay |  35 +++
+ .../subsys/pmci/pldm/serial_bridge/prj.conf   |  24 ++
+ .../pmci/pldm/serial_bridge/sample.yaml       |  24 ++
+ .../subsys/pmci/pldm/serial_bridge/src/main.c |  84 ++++++
+ subsys/pmci/mctp/CMakeLists.txt               |   1 +
+ subsys/pmci/mctp/Kconfig                      |  14 +
+ subsys/pmci/mctp/mctp_serial.c                | 274 ++++++++++++++++++
+ 9 files changed, 559 insertions(+)
+ create mode 100644 include/zephyr/pmci/mctp/mctp_serial.h
+ create mode 100644 samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+ create mode 100644 samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
+ create mode 100644 samples/subsys/pmci/pldm/serial_bridge/prj.conf
+ create mode 100644 samples/subsys/pmci/pldm/serial_bridge/sample.yaml
+ create mode 100644 samples/subsys/pmci/pldm/serial_bridge/src/main.c
+ create mode 100644 subsys/pmci/mctp/mctp_serial.c
+
+diff --git a/include/zephyr/pmci/mctp/mctp_serial.h b/include/zephyr/pmci/mctp/mctp_serial.h
+new file mode 100644
+index 00000000000..4e35a248ad5
+--- /dev/null
++++ b/include/zephyr/pmci/mctp/mctp_serial.h
+@@ -0,0 +1,94 @@
++/*
++ * Copyright (c) 2024 Intel Corporation
++ * Copyright (c) 2026 OCP HFM prototype
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ */
++
++#ifndef ZEPHYR_MCTP_SERIAL_H_
++#define ZEPHYR_MCTP_SERIAL_H_
++
++#include <stdint.h>
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/sys/ring_buffer.h>
++#include <libmctp.h>
++
++/**
++ * @brief An MCTP binding for Zephyr's interrupt-driven UART interface.
++ *
++ * Same MCTP-over-serial framing (DMTF DSP0253) as @ref mctp_binding_uart, but
++ * driven over the interrupt-driven UART API (uart_fifo_read / uart_fifo_fill)
++ * instead of the async API. This lets the binding run on UART controllers that
++ * implement only the interrupt-driven API and lack async/DMA support (for
++ * example the SiFive UART on QEMU's sifive_u machine).
++ */
++struct mctp_binding_serial {
++	/** @cond INTERNAL_HIDDEN */
++	struct mctp_binding binding;
++	const struct device *dev;
++
++	/* receive state machine */
++	struct mctp_pktbuf *rx_pkt;
++	uint8_t rx_exp_len;
++	uint16_t rx_fcs;
++	uint16_t rx_fcs_calc;
++	enum {
++		MCTP_SERIAL_STATE_WAIT_SYNC_START,
++		MCTP_SERIAL_STATE_WAIT_REVISION,
++		MCTP_SERIAL_STATE_WAIT_LEN,
++		MCTP_SERIAL_STATE_DATA,
++		MCTP_SERIAL_STATE_DATA_ESCAPED,
++		MCTP_SERIAL_STATE_WAIT_FCS1,
++		MCTP_SERIAL_STATE_WAIT_FCS2,
++		MCTP_SERIAL_STATE_WAIT_SYNC_END,
++	} rx_state;
++
++	/* tx ring buffer drained by the UART tx interrupt */
++	struct ring_buf tx_rb;
++	uint8_t tx_rb_buf[512];
++	/* staging buffer used to frame one packet before pushing to tx_rb */
++	uint8_t tx_buf[256];
++	/* set while the tx interrupt is enabled and draining tx_rb */
++	bool tx_active;
++
++	/** INTERNAL_HIDDEN @endcond */
++};
++
++/**
++ * @brief Enable UART RX/TX interrupts and start receiving MCTP messages.
++ *
++ * @param serial MCTP serial binding
++ */
++void mctp_serial_start_rx(struct mctp_binding_serial *serial);
++
++/** @cond INTERNAL_HIDDEN */
++int mctp_serial_start(struct mctp_binding *binding);
++int mctp_serial_tx(struct mctp_binding *binding, struct mctp_pktbuf *pkt);
++/** INTERNAL_HIDDEN @endcond */
++
++/**
++ * @brief Statically define an MCTP bus binding for an interrupt-driven UART.
++ *
++ * @param _name Symbolic name of the bus binding variable
++ * @param _dev UART device (const struct device *)
++ */
++#define MCTP_SERIAL_DT_DEFINE(_name, _dev)                                                         \
++	struct mctp_binding_serial _name = {                                                       \
++		.binding =                                                                         \
++			{                                                                          \
++				.name = STRINGIFY(_name),                                          \
++				.version = 1,                                                      \
++				.pkt_size = MCTP_PACKET_SIZE(MCTP_BTU),                            \
++				.pkt_header = 0,                                                    \
++				.pkt_trailer = 0,                                                  \
++				.start = mctp_serial_start,                                        \
++				.tx = mctp_serial_tx,                                              \
++			},                                                                         \
++		.dev = _dev,                                                                       \
++		.rx_state = MCTP_SERIAL_STATE_WAIT_SYNC_START,                                     \
++		.rx_pkt = NULL,                                                                    \
++	}
++
++#endif /* ZEPHYR_MCTP_SERIAL_H_ */
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+new file mode 100644
+index 00000000000..36f08732d9c
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+@@ -0,0 +1,9 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++cmake_minimum_required(VERSION 3.20.0)
++
++find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
++project(pldm_serial_bridge)
++
++target_sources(app PRIVATE src/main.c)
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay b/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
+new file mode 100644
+index 00000000000..49db00d53f3
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
+@@ -0,0 +1,35 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++/*
++ * Enable the second SiFive UART (uart1) as the MCTP-over-serial link.
++ * uart0 remains the Zephyr console/shell. On QEMU's sifive_u machine the
++ * second "-serial" backend is wired to uart1, which we point at a unix
++ * socket shared with the OpenBMC QEMU instance.
++ */
++
++&uart1 {
++	status = "okay";
++	current-speed = <115200>;
++};
++
++/*
++ * Boot on QEMU's sifive_u machine. The stock fu540 devicetree pins
++ * zephyr,sram to l2lim (0x08000000), which QEMU's sifive_u model does not
++ * implement, so images linked there never fetch. Redirect sram to ram0
++ * (DDR at 0x80000000) and shrink it to 256 MiB to match `qemu -m 256`
++ * (the stock 3.75 GiB size lets the heap/stacks run off the end of the
++ * QEMU-provided RAM and trips a Store/AMO access fault).
++ */
++/ {
++	chosen {
++		zephyr,sram = &ram0;
++	};
++};
++
++&ram0 {
++	reg = <0x80000000 0x10000000>;   /* 256 MiB */
++};
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/prj.conf b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+new file mode 100644
+index 00000000000..d50da1d42a9
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+@@ -0,0 +1,24 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++CONFIG_MCTP=y
++CONFIG_MCTP_HEAP_SIZE=8192
++CONFIG_MCTP_SERIAL=y
++
++# mctp_serial drives the interrupt-driven UART API.
++CONFIG_SERIAL=y
++CONFIG_UART_INTERRUPT_DRIVEN=y
++
++# A second SiFive UART (uart1) carries the MCTP link; uart0 stays the console.
++CONFIG_UART_SIFIVE_PORT_1=y
++
++CONFIG_PLDM_SUBSYS=y
++CONFIG_PLDM_RESPONDER=y
++CONFIG_PLDM_REQUESTER=y
++CONFIG_PLDM_TYPE_BASE=y
++
++CONFIG_LOG=y
++CONFIG_LOG_BUFFER_SIZE=4096
++CONFIG_MCTP_LOG_LEVEL_INF=y
++CONFIG_PLDM_LOG_LEVEL_INF=y
++CONFIG_MAIN_STACK_SIZE=4096
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/sample.yaml b/samples/subsys/pmci/pldm/serial_bridge/sample.yaml
+new file mode 100644
+index 00000000000..484c4983e74
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/sample.yaml
+@@ -0,0 +1,24 @@
++sample:
++  description: PLDM Type 0 (DSP0240) responder reachable from an OpenBMC host over
++    an MCTP-over-serial (DSP0253) link on a second UART. Meant to be bridged to an
++    OpenBMC QEMU instance via a host unix socket; twister only verifies that the
++    endpoint boots and arms the responder.
++  name: pldm_serial_bridge
++common:
++  tags:
++    - pmci
++    - mctp
++    - pldm
++tests:
++  sample.pmci.pldm.serial_bridge:
++    platform_allow:
++      - hifive_unleashed/fu540/u54
++    integration_platforms:
++      - hifive_unleashed/fu540/u54
++    harness: console
++    harness_config:
++      type: multi_line
++      ordered: true
++      regex:
++        - "PLDM serial bridge: EID 18"
++        - "Type 0 responder ready"
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/main.c b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+new file mode 100644
+index 00000000000..f84440013d5
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+@@ -0,0 +1,84 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * PLDM Type 0 endpoint over an MCTP-over-serial (DSP0253) link.
++ *
++ * This runs on a Zephyr QEMU instance whose second UART is bridged (via a
++ * host unix socket) to an OpenBMC QEMU instance running mctpd + pldmd. The
++ * BMC is the MCTP bus owner (EID 8); this endpoint answers as EID 18.
++ *
++ * The node registers the PLDM Type 0 responder so the BMC's pldmtool can run
++ *   pldmtool base GetTID / GetPLDMTypes / GetPLDMVersion / GetPLDMCommands
++ * against it. It then drains the serial link in the main loop.
++ */
++
++#include <stdlib.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/logging/log.h>
++
++#include <libmctp.h>
++
++#include <zephyr/pmci/mctp/mctp_serial.h>
++#include <zephyr/pmci/pldm/pldm.h>
++#include <zephyr/pmci/pldm/pldm_base.h>
++
++LOG_MODULE_REGISTER(serial_bridge, LOG_LEVEL_INF);
++
++/* MCTP endpoint IDs: BMC bus owner = 8, this Zephyr endpoint = 18. */
++#define LOCAL_EID 18
++#define BMC_EID   8
++
++static struct mctp *mctp_ctx;
++static struct pldm_ctx pldm;
++
++MCTP_SERIAL_DT_DEFINE(mctp_link, DEVICE_DT_GET(DT_NODELABEL(uart1)));
++
++int main(void)
++{
++	int rc;
++
++	LOG_INF("PLDM serial bridge: EID %d on %s (peer BMC EID %d)", LOCAL_EID,
++		CONFIG_BOARD_TARGET, BMC_EID);
++
++	mctp_set_alloc_ops(malloc, free, realloc);
++
++	mctp_ctx = mctp_init();
++	if (mctp_ctx == NULL) {
++		LOG_ERR("mctp_init failed");
++		return -1;
++	}
++
++	rc = mctp_register_bus(mctp_ctx, &mctp_link.binding, LOCAL_EID);
++	if (rc != 0) {
++		LOG_ERR("mctp_register_bus rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_ctx_init(&pldm, mctp_ctx, LOCAL_EID);
++	if (rc != 0) {
++		LOG_ERR("pldm_ctx_init rc=%d", rc);
++		return -1;
++	}
++
++	rc = pldm_base_responder_register(&pldm);
++	if (rc != 0) {
++		LOG_ERR("pldm_base_responder_register rc=%d", rc);
++		return -1;
++	}
++
++	/* Enable UART interrupts and start feeding the DSP0253 decoder. */
++	mctp_serial_start_rx(&mctp_link);
++
++	LOG_INF("Type 0 responder ready; waiting for PLDM requests from the BMC");
++
++	while (true) {
++		k_sleep(K_FOREVER);
++	}
++
++	return 0;
++}
+diff --git a/subsys/pmci/mctp/CMakeLists.txt b/subsys/pmci/mctp/CMakeLists.txt
+index f1082d23248..faf2fcf3a13 100644
+--- a/subsys/pmci/mctp/CMakeLists.txt
++++ b/subsys/pmci/mctp/CMakeLists.txt
+@@ -1,6 +1,7 @@
+ zephyr_library()
+ zephyr_library_sources(mctp_memory.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_UART mctp_uart.c)
++zephyr_library_sources_ifdef(CONFIG_MCTP_SERIAL mctp_serial.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_CONTROLLER mctp_i2c_gpio_controller.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_TARGET mctp_i2c_gpio_target.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C mctp_i2c.c)
+diff --git a/subsys/pmci/mctp/Kconfig b/subsys/pmci/mctp/Kconfig
+index 42da7de4f09..5a2855b65ad 100644
+--- a/subsys/pmci/mctp/Kconfig
++++ b/subsys/pmci/mctp/Kconfig
+@@ -26,6 +26,20 @@ config MCTP_UART
+ 	  Build the MCTP UART binding to use MCTP over Zephyr's async UART
+ 	  interface.
+ 
++config MCTP_SERIAL
++	bool "MCTP over serial Binding (DSP0253), interrupt-driven"
++	depends on SERIAL
++	depends on UART_INTERRUPT_DRIVEN
++	select RING_BUFFER
++	help
++	  Build the DMTF DSP0253 MCTP-over-serial binding driven over the
++	  interrupt-driven UART API (uart_fifo_read / uart_fifo_fill). The wire
++	  framing is identical to MCTP_UART (0x7e flags, byte stuffing, CRC-16
++	  FCS) and is compatible with the Linux kernel mctp-serial driver used
++	  by OpenBMC. Unlike MCTP_UART this does not require the async/DMA UART
++	  API, so it runs on controllers that implement only the interrupt-driven
++	  API (for example the SiFive UART on QEMU's sifive_u machine).
++
+ config MCTP_I2C_GPIO_CONTROLLER
+ 	bool "MCTP I2C+GPIO Controller Binding"
+ 	depends on I2C
+diff --git a/subsys/pmci/mctp/mctp_serial.c b/subsys/pmci/mctp/mctp_serial.c
+new file mode 100644
+index 00000000000..01ba631046a
+--- /dev/null
++++ b/subsys/pmci/mctp/mctp_serial.c
+@@ -0,0 +1,274 @@
++/*
++ * Copyright (c) 2024 Intel Corporation
++ * Copyright (c) 2026 OCP HFM prototype
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * MCTP-over-serial (DMTF DSP0253) binding driven over the interrupt-driven
++ * UART API. The framing is identical to the async mctp_uart binding; only the
++ * I/O path differs so this can run on controllers without async/DMA support.
++ */
++
++#include <zephyr/sys/__assert.h>
++#include <zephyr/kernel.h>
++#include <zephyr/drivers/uart.h>
++#include <zephyr/sys/ring_buffer.h>
++#include <zephyr/pmci/mctp/mctp_serial.h>
++#include <crc-16-ccitt.h>
++
++#include <zephyr/logging/log.h>
++LOG_MODULE_REGISTER(mctp_serial, CONFIG_MCTP_LOG_LEVEL);
++
++#define MCTP_SERIAL_REVISION     0x01
++#define MCTP_SERIAL_FRAMING_FLAG 0x7e
++#define MCTP_SERIAL_ESCAPE       0x7d
++
++struct mctp_serial_header {
++	uint8_t flag;
++	uint8_t revision;
++	uint8_t len;
++};
++
++struct mctp_serial_trailer {
++	uint8_t fcs_msb;
++	uint8_t fcs_lsb;
++	uint8_t flag;
++};
++
++static inline struct mctp_binding_serial *binding_to_serial(struct mctp_binding *b)
++{
++	return (struct mctp_binding_serial *)b;
++}
++
++static void mctp_serial_finish_pkt(struct mctp_binding_serial *serial, bool valid)
++{
++	struct mctp_pktbuf *pkt = serial->rx_pkt;
++
++	if (valid) {
++		__ASSERT_NO_MSG(pkt);
++		mctp_bus_rx(&serial->binding, pkt);
++	}
++
++	serial->rx_pkt = NULL;
++}
++
++static void mctp_serial_start_pkt(struct mctp_binding_serial *serial, uint8_t len)
++{
++	__ASSERT_NO_MSG(serial->rx_pkt == NULL);
++
++	serial->rx_pkt = mctp_pktbuf_alloc(&serial->binding, len);
++
++	__ASSERT_NO_MSG(serial->rx_pkt);
++}
++
++static size_t mctp_serial_pkt_escape(struct mctp_pktbuf *pkt, uint8_t *buf)
++{
++	uint8_t total_len;
++	uint8_t *p;
++	int i, j;
++
++	total_len = pkt->end - pkt->mctp_hdr_off;
++
++	p = (void *)mctp_pktbuf_hdr(pkt);
++
++	for (i = 0, j = 0; i < total_len; i++, j++) {
++		uint8_t c = p[i];
++
++		if (c == MCTP_SERIAL_FRAMING_FLAG || c == MCTP_SERIAL_ESCAPE) {
++			if (buf) {
++				buf[j] = MCTP_SERIAL_ESCAPE;
++			}
++			j++;
++			c ^= 0x20;
++		}
++		if (buf) {
++			buf[j] = c;
++		}
++	}
++
++	return j;
++}
++
++/*
++ * Per-byte DSP0253 decode state machine. Mirrors mctp_uart_consume().
++ */
++static void mctp_serial_consume(struct mctp_binding_serial *serial, uint8_t c)
++{
++	struct mctp_pktbuf *pkt = serial->rx_pkt;
++	bool valid = false;
++
++	__ASSERT_NO_MSG(!pkt == (serial->rx_state == MCTP_SERIAL_STATE_WAIT_SYNC_START ||
++				 serial->rx_state == MCTP_SERIAL_STATE_WAIT_REVISION ||
++				 serial->rx_state == MCTP_SERIAL_STATE_WAIT_LEN));
++
++	switch (serial->rx_state) {
++	case MCTP_SERIAL_STATE_WAIT_SYNC_START:
++		if (c != MCTP_SERIAL_FRAMING_FLAG) {
++			if (pkt) {
++				mctp_serial_finish_pkt(serial, false);
++			}
++		} else {
++			serial->rx_state = MCTP_SERIAL_STATE_WAIT_REVISION;
++		}
++		break;
++	case MCTP_SERIAL_STATE_WAIT_REVISION:
++		if (c == MCTP_SERIAL_REVISION) {
++			serial->rx_state = MCTP_SERIAL_STATE_WAIT_LEN;
++			serial->rx_fcs_calc = crc_16_ccitt_byte(FCS_INIT_16, c);
++		} else if (c == MCTP_SERIAL_FRAMING_FLAG) {
++			/* stray trailing flag: stay put and resync */
++		} else {
++			serial->rx_state = MCTP_SERIAL_STATE_WAIT_SYNC_START;
++		}
++		break;
++	case MCTP_SERIAL_STATE_WAIT_LEN:
++		if (c > serial->binding.pkt_size || c < sizeof(struct mctp_hdr)) {
++			serial->rx_state = MCTP_SERIAL_STATE_WAIT_SYNC_START;
++		} else {
++			mctp_serial_start_pkt(serial, 0);
++			pkt = serial->rx_pkt;
++			serial->rx_exp_len = c;
++			serial->rx_state = MCTP_SERIAL_STATE_DATA;
++			serial->rx_fcs_calc = crc_16_ccitt_byte(serial->rx_fcs_calc, c);
++		}
++		break;
++	case MCTP_SERIAL_STATE_DATA:
++		if (c == MCTP_SERIAL_ESCAPE) {
++			serial->rx_state = MCTP_SERIAL_STATE_DATA_ESCAPED;
++		} else {
++			mctp_pktbuf_push(pkt, &c, 1);
++			serial->rx_fcs_calc = crc_16_ccitt_byte(serial->rx_fcs_calc, c);
++			if (pkt->end - pkt->mctp_hdr_off == serial->rx_exp_len) {
++				serial->rx_state = MCTP_SERIAL_STATE_WAIT_FCS1;
++			}
++		}
++		break;
++	case MCTP_SERIAL_STATE_DATA_ESCAPED:
++		c ^= 0x20;
++		mctp_pktbuf_push(pkt, &c, 1);
++		serial->rx_fcs_calc = crc_16_ccitt_byte(serial->rx_fcs_calc, c);
++		if (pkt->end - pkt->mctp_hdr_off == serial->rx_exp_len) {
++			serial->rx_state = MCTP_SERIAL_STATE_WAIT_FCS1;
++		} else {
++			serial->rx_state = MCTP_SERIAL_STATE_DATA;
++		}
++		break;
++	case MCTP_SERIAL_STATE_WAIT_FCS1:
++		serial->rx_fcs = c << 8;
++		serial->rx_state = MCTP_SERIAL_STATE_WAIT_FCS2;
++		break;
++	case MCTP_SERIAL_STATE_WAIT_FCS2:
++		serial->rx_fcs |= c;
++		serial->rx_state = MCTP_SERIAL_STATE_WAIT_SYNC_END;
++		break;
++	case MCTP_SERIAL_STATE_WAIT_SYNC_END:
++		if (serial->rx_fcs == serial->rx_fcs_calc) {
++			valid = (c == MCTP_SERIAL_FRAMING_FLAG);
++			if (!valid) {
++				LOG_DBG("missing end frame marker");
++			}
++		} else {
++			valid = false;
++			LOG_DBG("invalid fcs : 0x%04x, expect 0x%04x", serial->rx_fcs,
++				serial->rx_fcs_calc);
++		}
++
++		mctp_serial_finish_pkt(serial, valid);
++		serial->rx_state = MCTP_SERIAL_STATE_WAIT_SYNC_START;
++		break;
++	}
++}
++
++/*
++ * Note on the SiFive UART: its irq_is_pending()/irq_tx_ready() report the raw
++ * hardware condition (TXWM is asserted whenever the TX FIFO is below the
++ * watermark, i.e. almost always). Looping on irq_is_pending() would therefore
++ * never terminate, and honouring irq_tx_ready() unconditionally would keep
++ * re-triggering the TX path. So this ISR runs a single pass and only touches
++ * the TX FIFO while we have queued data (tx_active).
++ */
++static void mctp_serial_isr(const struct device *dev, void *user_data)
++{
++	struct mctp_binding_serial *serial = user_data;
++	uint8_t byte;
++
++	uart_irq_update(dev);
++
++	while (uart_irq_rx_ready(dev)) {
++		if (uart_fifo_read(dev, &byte, 1) == 1) {
++			mctp_serial_consume(serial, byte);
++		}
++	}
++
++	if (serial->tx_active && uart_irq_tx_ready(dev)) {
++		if (ring_buf_get(&serial->tx_rb, &byte, 1) == 1) {
++			uart_fifo_fill(dev, &byte, 1);
++		} else {
++			uart_irq_tx_disable(dev);
++			serial->tx_active = false;
++		}
++	}
++}
++
++void mctp_serial_start_rx(struct mctp_binding_serial *serial)
++{
++	ring_buf_init(&serial->tx_rb, sizeof(serial->tx_rb_buf), serial->tx_rb_buf);
++	serial->tx_active = false;
++	uart_irq_rx_disable(serial->dev);
++	uart_irq_tx_disable(serial->dev);
++	uart_irq_callback_user_data_set(serial->dev, mctp_serial_isr, serial);
++	uart_irq_rx_enable(serial->dev);
++}
++
++int mctp_serial_tx(struct mctp_binding *b, struct mctp_pktbuf *pkt)
++{
++	struct mctp_binding_serial *serial = binding_to_serial(b);
++	struct mctp_serial_header *hdr;
++	struct mctp_serial_trailer *tlr;
++	uint8_t *buf;
++	size_t len;
++	uint16_t fcs;
++
++	len = mctp_pktbuf_size(pkt);
++
++	hdr = (void *)serial->tx_buf;
++	hdr->flag = MCTP_SERIAL_FRAMING_FLAG;
++	hdr->revision = MCTP_SERIAL_REVISION;
++	hdr->len = len;
++
++	fcs = crc_16_ccitt(FCS_INIT_16, (const uint8_t *)hdr + 1, 2);
++	fcs = crc_16_ccitt(fcs, (const uint8_t *)mctp_pktbuf_hdr(pkt), len);
++
++	buf = (void *)(hdr + 1);
++
++	len = mctp_serial_pkt_escape(pkt, NULL);
++	if (len + sizeof(*hdr) + sizeof(*tlr) > sizeof(serial->tx_buf)) {
++		return -EMSGSIZE;
++	}
++
++	mctp_serial_pkt_escape(pkt, buf);
++	buf += len;
++
++	tlr = (void *)buf;
++	tlr->flag = MCTP_SERIAL_FRAMING_FLAG;
++	tlr->fcs_msb = fcs >> 8;
++	tlr->fcs_lsb = fcs & 0xff;
++
++	len += sizeof(*hdr) + sizeof(*tlr);
++
++	if (ring_buf_put(&serial->tx_rb, serial->tx_buf, len) != len) {
++		LOG_ERR("tx ring buffer full, dropping packet");
++		return -ENOMEM;
++	}
++
++	serial->tx_active = true;
++	uart_irq_tx_enable(serial->dev);
++
++	return 0;
++}
++
++int mctp_serial_start(struct mctp_binding *binding)
++{
++	mctp_binding_set_tx_enabled(binding, true);
++	return 0;
++}
+-- 
+2.25.1
+

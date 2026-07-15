@@ -1,0 +1,690 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HFM <hfm@example.com>
+Date: Wed, 15 Jul 2026 10:41:10 +0800
+Subject: [PATCH 8/8] subsys/pmci/mctp: add DSP0236 control responder; wire
+ Type 2 into serial_bridge
+
+Add the baseline MCTP control-protocol responder needed for a bus owner
+(OpenBMC's mctpd) to enumerate a statically-addressed endpoint, and wire
+the Type 2 sensor into the serial_bridge sample so pldmd can discover and
+poll it end to end.
+
+Key pieces:
+
+  * include/zephyr/pmci/mctp/mctp_control.h + subsys/pmci/mctp/mctp_control.c
+    (CONFIG_MCTP_CONTROL) - control responder.
+      libmctp only routes transport-specific control commands (0xF0-0xFF)
+      to a binding; the baseline commands land on the generic message
+      handler. This responder installs itself as the MCTP rx_all callback,
+      answers Set/Get Endpoint ID (0x01/0x02), Get MCTP Version Support
+      (0x04) and Get Message Type Support (0x05) - reporting message types
+      {0x00 control, 0x01 PLDM} - and forwards every non-control message to
+      the downstream handler (the PLDM dispatcher) it was chained onto.
+      Wire formats match mctpd's strict validation (IID echo, exact
+      response length). The node keeps its fixed EID 18, so Set Endpoint ID
+      accepts only a matching or no-change (0) request.
+
+  * samples/.../serial_bridge - integration.
+      Enable CONFIG_MCTP_CONTROL + CONFIG_PLDM_TYPE_PLATFORM; register a
+      simulated die-temperature Numeric Sensor (sensor_id 1) with the Type 2
+      responder; chain the control responder above the PLDM dispatcher. Also
+      adds a reverse-direction probe thread that queries the BMC (EID 8) with
+      GetTID/GetPLDMTypes/GetPLDMVersion to exercise the host->BMC path.
+
+With this, mctpd runs Get Endpoint ID / Get Message Type Support against
+the node, publishes it on D-Bus, and pldmd's platform-mc discovers it and
+polls GetSensorReading. The BMC-side enablement is patch 0006.
+
+Signed-off-by: HFM <hfm@example.com>
+---
+ include/zephyr/pmci/mctp/mctp_control.h       |  93 +++++++
+ .../subsys/pmci/pldm/serial_bridge/prj.conf   |   5 +
+ .../subsys/pmci/pldm/serial_bridge/src/main.c | 171 +++++++++++-
+ subsys/pmci/mctp/CMakeLists.txt               |   1 +
+ subsys/pmci/mctp/Kconfig                      |  22 ++
+ subsys/pmci/mctp/mctp_control.c               | 254 ++++++++++++++++++
+ 6 files changed, 542 insertions(+), 4 deletions(-)
+ create mode 100644 include/zephyr/pmci/mctp/mctp_control.h
+ create mode 100644 subsys/pmci/mctp/mctp_control.c
+
+diff --git a/include/zephyr/pmci/mctp/mctp_control.h b/include/zephyr/pmci/mctp/mctp_control.h
+new file mode 100644
+index 00000000000..40f503e1df8
+--- /dev/null
++++ b/include/zephyr/pmci/mctp/mctp_control.h
+@@ -0,0 +1,93 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ */
++
++#ifndef ZEPHYR_INCLUDE_PMCI_MCTP_MCTP_CONTROL_H_
++#define ZEPHYR_INCLUDE_PMCI_MCTP_MCTP_CONTROL_H_
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <libmctp.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/** MCTP message type for the control protocol (DSP0236 Table 1). */
++#define MCTP_MSG_TYPE_CTRL 0x00
++
++/**
++ * @file
++ * @brief MCTP control-protocol responder (DSP0236 §11) for a fixed-address
++ *        Zephyr endpoint.
++ *
++ * libmctp's core only dispatches transport-specific control commands
++ * (0xF0-0xFF) to a binding's @c control_rx callback; the baseline control
++ * commands (Set/Get Endpoint ID, Get MCTP Version Support, Get Message Type
++ * Support) fall through to the generic @c message_rx handler. A bus owner such
++ * as OpenBMC's mctpd must be able to run those commands against this node
++ * before it will publish it on D-Bus with the message types it supports, which
++ * in turn is what lets pldmd discover and poll this terminus.
++ *
++ * This responder installs itself as the MCTP receive callback, answers the
++ * baseline control requests for a statically-addressed endpoint, and forwards
++ * every other message to a downstream handler (typically the PLDM dispatcher).
++ */
++
++/**
++ * @brief State for the MCTP control responder.
++ *
++ * The endpoint EID is fixed at init time. Set Endpoint ID requests are only
++ * accepted when they match that EID (this node does not support dynamic EID
++ * reassignment, since libmctp exposes no public API to change the bus EID).
++ */
++struct mctp_control_ctx {
++	struct mctp *mctp;
++	mctp_eid_t local_eid;
++	const uint8_t *msg_types;
++	size_t num_msg_types;
++	mctp_rx_fn downstream;
++	void *downstream_data;
++};
++
++/**
++ * @brief Initialise the control responder and take over the MCTP RX callback.
++ *
++ * Registers @c mctp_control_rx() as the receive callback via
++ * @c mctp_set_rx_all(); baseline control requests are answered here and all
++ * other messages are forwarded to @p downstream. Call this after any downstream
++ * subsystem has been initialised, passing that subsystem's receive callback so
++ * this responder can chain to it.
++ *
++ * @param ctx             Responder state (must outlive the MCTP context).
++ * @param mctp            MCTP core the endpoint is bound to.
++ * @param eid             Fixed EID reported for this endpoint.
++ * @param msg_types       Array of MCTP message types this node supports
++ *                        (for Get Message Type Support), e.g. {0x01} for PLDM.
++ * @param num_msg_types   Number of entries in @p msg_types.
++ * @param downstream      Handler for non-control messages. May be NULL.
++ * @param downstream_data Opaque argument passed to @p downstream.
++ *
++ * @return 0 on success, negative errno otherwise.
++ */
++int mctp_control_responder_init(struct mctp_control_ctx *ctx, struct mctp *mctp,
++				mctp_eid_t eid, const uint8_t *msg_types,
++				size_t num_msg_types, mctp_rx_fn downstream,
++				void *downstream_data);
++
++/**
++ * @brief MCTP receive callback (matches @c mctp_rx_fn).
++ *
++ * Normally installed by @ref mctp_control_responder_init; exposed for tests.
++ */
++void mctp_control_rx(uint8_t src_eid, bool tag_owner, uint8_t msg_tag,
++		     void *data, void *msg, size_t len);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif /* ZEPHYR_INCLUDE_PMCI_MCTP_MCTP_CONTROL_H_ */
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/prj.conf b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+index d50da1d42a9..a95e73426c8 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/prj.conf
++++ b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+@@ -5,6 +5,10 @@ CONFIG_MCTP=y
+ CONFIG_MCTP_HEAP_SIZE=8192
+ CONFIG_MCTP_SERIAL=y
+ 
++# Answer the baseline MCTP control commands so OpenBMC's mctpd can enumerate
++# this endpoint and pldmd can discover it as a PLDM terminus.
++CONFIG_MCTP_CONTROL=y
++
+ # mctp_serial drives the interrupt-driven UART API.
+ CONFIG_SERIAL=y
+ CONFIG_UART_INTERRUPT_DRIVEN=y
+@@ -16,6 +20,7 @@ CONFIG_PLDM_SUBSYS=y
+ CONFIG_PLDM_RESPONDER=y
+ CONFIG_PLDM_REQUESTER=y
+ CONFIG_PLDM_TYPE_BASE=y
++CONFIG_PLDM_TYPE_PLATFORM=y
+ 
+ CONFIG_LOG=y
+ CONFIG_LOG_BUFFER_SIZE=4096
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/main.c b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+index f84440013d5..ca123b9be59 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/src/main.c
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+@@ -9,9 +9,16 @@
+  * host unix socket) to an OpenBMC QEMU instance running mctpd + pldmd. The
+  * BMC is the MCTP bus owner (EID 8); this endpoint answers as EID 18.
+  *
+- * The node registers the PLDM Type 0 responder so the BMC's pldmtool can run
+- *   pldmtool base GetTID / GetPLDMTypes / GetPLDMVersion / GetPLDMCommands
+- * against it. It then drains the serial link in the main loop.
++ * Bidirectional Type 0 traffic:
++ *   - Responder: the BMC's pldmtool can run GetTID / GetPLDMTypes /
++ *     GetPLDMVersion / GetPLDMCommands against this node (EID 18).
++ *   - Requester: after start-up this node actively queries the BMC (EID 8)
++ *     with GetTID / GetPLDMTypes / GetPLDMVersion and logs the replies,
++ *     exercising the reverse (host -> BMC) data path.
++ *
++ * The MCTP-over-serial RX runs in the UART ISR, so the requester response
++ * delivery path (pldm_deliver_response) must be ISR-safe; it uses a spinlock
++ * rather than a mutex for exactly this reason.
+  */
+ 
+ #include <stdlib.h>
+@@ -22,10 +29,17 @@
+ #include <zephyr/logging/log.h>
+ 
+ #include <libmctp.h>
++#include <libpldm/base.h>
++#include <libpldm/pldm_types.h>
+ 
+ #include <zephyr/pmci/mctp/mctp_serial.h>
++#include <zephyr/pmci/mctp/mctp_control.h>
+ #include <zephyr/pmci/pldm/pldm.h>
+ #include <zephyr/pmci/pldm/pldm_base.h>
++#if defined(CONFIG_PLDM_TYPE_PLATFORM)
++#include <zephyr/pmci/pldm/pldm_platform.h>
++#include <libpldm/platform.h>
++#endif
+ 
+ LOG_MODULE_REGISTER(serial_bridge, LOG_LEVEL_INF);
+ 
+@@ -33,11 +47,135 @@ LOG_MODULE_REGISTER(serial_bridge, LOG_LEVEL_INF);
+ #define LOCAL_EID 18
+ #define BMC_EID   8
+ 
++/*
++ * Give the BMC time to boot pldmd, then retry GetTID until it answers. The BMC
++ * only brings up its MCTP link / route late in the two-QEMU harness, so keep
++ * retrying for several minutes.
++ */
++#define PROBE_START_DELAY_MS 5000
++#define PROBE_RETRY_MS       3000
++#define PROBE_MAX_TRIES      200
++
+ static struct mctp *mctp_ctx;
+ static struct pldm_ctx pldm;
++static struct mctp_control_ctx mctp_control;
++
++/* MCTP message types this endpoint answers to (DSP0236 Table 1). */
++static const uint8_t supported_msg_types[] = {
++	MCTP_MSG_TYPE_CTRL,
++	PLDM_MCTP_MSG_TYPE,
++};
+ 
+ MCTP_SERIAL_DT_DEFINE(mctp_link, DEVICE_DT_GET(DT_NODELABEL(uart1)));
+ 
++/*
++ * Reverse-direction probe: query the BMC (EID 8) from this node. Runs in a
++ * dedicated thread so the responder (serviced from the UART ISR) keeps
++ * working regardless of how long the BMC takes to come up.
++ */
++static void probe_bmc(void)
++{
++	uint8_t types[8] = { 0 };
++	uint8_t tid = 0;
++	ver32_t ver;
++	int rc;
++	int i;
++
++	k_sleep(K_MSEC(PROBE_START_DELAY_MS));
++
++	for (i = 1; i <= PROBE_MAX_TRIES; i++) {
++		rc = pldm_base_get_tid_sync(&pldm, BMC_EID, &tid);
++		if (rc == 0) {
++			LOG_INF("BMC GetTID -> 0x%02x (try %d)", tid, i);
++			break;
++		}
++		LOG_WRN("BMC GetTID try %d rc=%d, retrying", i, rc);
++		k_sleep(K_MSEC(PROBE_RETRY_MS));
++	}
++
++	if (rc != 0) {
++		LOG_ERR("BMC did not answer GetTID after %d tries", PROBE_MAX_TRIES);
++		return;
++	}
++
++	rc = pldm_base_get_types_sync(&pldm, BMC_EID, types);
++	if (rc != 0) {
++		LOG_ERR("BMC GetPLDMTypes rc=%d", rc);
++	} else {
++		LOG_INF("BMC GetPLDMTypes -> byte0=0x%02x", types[0]);
++	}
++
++	rc = pldm_base_get_version_sync(&pldm, BMC_EID, PLDM_BASE, &ver);
++	if (rc != 0) {
++		LOG_ERR("BMC GetPLDMVersion rc=%d", rc);
++	} else {
++		LOG_INF("BMC GetPLDMVersion(BASE) -> %u.%u.%u", ver.major & 0x0f,
++			ver.minor & 0x0f, ver.update & 0x0f);
++	}
++
++	LOG_INF("Reverse-direction PLDM probe to BMC complete");
++}
++
++K_THREAD_DEFINE(probe_tid, 2048, probe_bmc, NULL, NULL, NULL,
++		K_LOWEST_APPLICATION_THREAD_PRIO, 0, -1);
++
++#if defined(CONFIG_PLDM_TYPE_PLATFORM)
++/* DSP0249 entity type for a temperature sensor (0x002B). */
++#define TEMP_ENTITY_TYPE 0x002B
++#define TEMP_SENSOR_ID	 1
++
++/*
++ * Simulated die-temperature source: a slow triangular sweep between 30 and
++ * 80 C so a polling management controller sees the reading move. The raw
++ * value is degrees C (unit modifier 0), matching the advertised PDR.
++ */
++static int read_die_temp(const struct pldm_platform_sensor *sensor,
++			 int32_t *reading)
++{
++	static int32_t value = 30;
++	static int32_t step = 1;
++
++	ARG_UNUSED(sensor);
++
++	value += step;
++	if (value >= 80 || value <= 30) {
++		step = -step;
++	}
++	*reading = value;
++	return 0;
++}
++
++static const struct pldm_platform_sensor die_temp_sensor = {
++	.sensor_id = TEMP_SENSOR_ID,
++	.entity_type = TEMP_ENTITY_TYPE,
++	.entity_instance = 1,
++	.base_unit = PLDM_SENSOR_UNIT_DEGRESS_C,
++	.unit_modifier = 0,
++	.read = read_die_temp,
++};
++
++static int platform_responder_setup(void)
++{
++	int rc;
++
++	rc = pldm_platform_add_numeric_sensor(&die_temp_sensor);
++	if (rc != 0) {
++		LOG_ERR("pldm_platform_add_numeric_sensor rc=%d", rc);
++		return rc;
++	}
++
++	rc = pldm_platform_responder_register(&pldm);
++	if (rc != 0) {
++		LOG_ERR("pldm_platform_responder_register rc=%d", rc);
++		return rc;
++	}
++
++	LOG_INF("Type 2 responder ready; sensor %d (temperature) exposed via PDR",
++		TEMP_SENSOR_ID);
++	return 0;
++}
++#endif /* CONFIG_PLDM_TYPE_PLATFORM */
++
+ int main(void)
+ {
+ 	int rc;
+@@ -71,10 +209,35 @@ int main(void)
+ 		return -1;
+ 	}
+ 
++#if defined(CONFIG_PLDM_TYPE_PLATFORM)
++	rc = platform_responder_setup();
++	if (rc != 0) {
++		return -1;
++	}
++#endif
++
++	/*
++	 * Take over the MCTP receive callback to answer the baseline control
++	 * commands (Set/Get Endpoint ID, Get Message Type Support) that the BMC's
++	 * mctpd runs before publishing this endpoint. Non-control messages are
++	 * chained to the PLDM dispatcher installed by pldm_ctx_init().
++	 */
++	rc = mctp_control_responder_init(&mctp_control, mctp_ctx, LOCAL_EID,
++					 supported_msg_types,
++					 ARRAY_SIZE(supported_msg_types),
++					 pldm_ctx_rx, &pldm);
++	if (rc != 0) {
++		LOG_ERR("mctp_control_responder_init rc=%d", rc);
++		return -1;
++	}
++
+ 	/* Enable UART interrupts and start feeding the DSP0253 decoder. */
+ 	mctp_serial_start_rx(&mctp_link);
+ 
+-	LOG_INF("Type 0 responder ready; waiting for PLDM requests from the BMC");
++	LOG_INF("MCTP control + Type 0/2 responders ready; waiting for the BMC");
++
++	/* Kick off the reverse-direction requester probe against the BMC. */
++	k_thread_start(probe_tid);
+ 
+ 	while (true) {
+ 		k_sleep(K_FOREVER);
+diff --git a/subsys/pmci/mctp/CMakeLists.txt b/subsys/pmci/mctp/CMakeLists.txt
+index faf2fcf3a13..94830e90aad 100644
+--- a/subsys/pmci/mctp/CMakeLists.txt
++++ b/subsys/pmci/mctp/CMakeLists.txt
+@@ -1,5 +1,6 @@
+ zephyr_library()
+ zephyr_library_sources(mctp_memory.c)
++zephyr_library_sources_ifdef(CONFIG_MCTP_CONTROL mctp_control.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_UART mctp_uart.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_SERIAL mctp_serial.c)
+ zephyr_library_sources_ifdef(CONFIG_MCTP_I2C_GPIO_CONTROLLER mctp_i2c_gpio_controller.c)
+diff --git a/subsys/pmci/mctp/Kconfig b/subsys/pmci/mctp/Kconfig
+index 5a2855b65ad..8cdcc024ca2 100644
+--- a/subsys/pmci/mctp/Kconfig
++++ b/subsys/pmci/mctp/Kconfig
+@@ -19,6 +19,28 @@ config MCTP_HEAP_SIZE
+ 	  libmctp's allocation operations. This setting defines the size of
+ 	  the dedicated MCTP heap in bytes. Defaults to 1KB for small packets.
+ 
++config MCTP_CONTROL
++	bool "MCTP control-protocol responder (DSP0236)"
++	help
++	  Build a responder for the baseline MCTP control commands (Set/Get
++	  Endpoint ID, Get MCTP Version Support, Get Message Type Support) for a
++	  statically-addressed endpoint. libmctp only routes transport-specific
++	  control commands (0xF0-0xFF) to a binding; the baseline commands land
++	  on the generic message handler. A bus owner such as OpenBMC's mctpd
++	  runs these commands before publishing the endpoint on D-Bus, and
++	  pldmd only discovers endpoints that report PLDM (message type 1) via
++	  Get Message Type Support. Enable this so the node can be enumerated
++	  and polled by the BMC.
++
++config MCTP_CONTROL_MAX_MSG_TYPES
++	int "Maximum MCTP message types reported by the control responder"
++	depends on MCTP_CONTROL
++	range 1 16
++	default 4
++	help
++	  Upper bound on the number of MCTP message types reported in a Get
++	  Message Type Support response. Sizes the static response buffer.
++
+ config MCTP_UART
+ 	bool "MCTP UART Binding"
+ 	depends on UART_ASYNC_API
+diff --git a/subsys/pmci/mctp/mctp_control.c b/subsys/pmci/mctp/mctp_control.c
+new file mode 100644
+index 00000000000..9e478dfa5f4
+--- /dev/null
++++ b/subsys/pmci/mctp/mctp_control.c
+@@ -0,0 +1,254 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * MCTP control-protocol responder (DMTF DSP0236 §11) for a statically
++ * addressed endpoint.
++ *
++ * libmctp's core dispatches only transport-specific control commands
++ * (0xF0-0xFF) to a binding's control_rx callback; the baseline control
++ * commands land on the generic message_rx handler. A bus owner such as
++ * OpenBMC's mctpd runs Get Endpoint ID, (optionally) Set Endpoint ID and
++ * Get Message Type Support against a node before publishing it on D-Bus.
++ * pldmd's MctpDiscovery only picks up endpoints whose SupportedMessageTypes
++ * include PLDM (type 1), so answering these commands is what lets the BMC
++ * discover and poll this terminus.
++ *
++ * MCTP message framing follows libmctp's convention: the first byte of the
++ * message body is the MCTP message type (0x00 for control), matching the
++ * PLDM path (byte 0 == 0x01).
++ */
++
++#include <errno.h>
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/logging/log.h>
++
++#include <libmctp.h>
++#include <libmctp-cmds.h>
++
++#include <zephyr/pmci/mctp/mctp_control.h>
++
++LOG_MODULE_REGISTER(mctp_control, CONFIG_MCTP_LOG_LEVEL);
++
++/* MCTP control message type (DSP0236 Table 1); MCTP_MSG_TYPE_CTRL in the API. */
++#define MCTP_MSG_TYPE_CONTROL MCTP_MSG_TYPE_CTRL
++
++/* Rq/D/Instance-ID byte (DSP0236 §11.4): bit7 Rq, bit6 D, bits4:0 instance. */
++#define CTRL_RESP_RQ_CLEAR 0x00
++
++/* Set Endpoint ID response status: assignment accepted, no EID pool. */
++#define SET_EID_STATUS_ACCEPTED 0x00
++
++/*
++ * Byte offsets into the MCTP message body (type byte + control header +
++ * payload). See DSP0236 §11.4.
++ */
++#define OFF_MSG_TYPE     0U
++#define OFF_RQ_DGRAM     1U
++#define OFF_CMD_CODE     2U
++#define OFF_CTRL_PAYLOAD 3U
++
++#define CTRL_HDR_LEN OFF_CTRL_PAYLOAD
++
++/*
++ * Fill the control-response header into @buf and transmit @len bytes (message
++ * type + control header + payload) back to @src. The caller fills the payload.
++ */
++static void ctrl_send(struct mctp_control_ctx *ctx, mctp_eid_t src,
++		      uint8_t msg_tag, uint8_t iid, uint8_t cmd, uint8_t *buf,
++		      size_t len)
++{
++	int rc;
++
++	buf[OFF_MSG_TYPE] = MCTP_MSG_TYPE_CONTROL;
++	buf[OFF_RQ_DGRAM] = CTRL_RESP_RQ_CLEAR |
++			    (iid & MCTP_CTRL_HDR_INSTANCE_ID_MASK);
++	buf[OFF_CMD_CODE] = cmd;
++
++	rc = mctp_message_tx(ctx->mctp, src, MCTP_MESSAGE_TO_SRC, msg_tag, buf,
++			     len);
++	if (rc != 0) {
++		LOG_WRN("control cmd 0x%02x tx failed: %d", cmd, rc);
++	}
++}
++
++static void ctrl_send_cc(struct mctp_control_ctx *ctx, mctp_eid_t src,
++			 uint8_t msg_tag, uint8_t iid, uint8_t cmd, uint8_t cc)
++{
++	uint8_t buf[CTRL_HDR_LEN + 1];
++
++	buf[OFF_CTRL_PAYLOAD] = cc;
++	ctrl_send(ctx, src, msg_tag, iid, cmd, buf, sizeof(buf));
++}
++
++static void handle_set_eid(struct mctp_control_ctx *ctx, mctp_eid_t src,
++			   uint8_t msg_tag, uint8_t iid, const uint8_t *msg,
++			   size_t len)
++{
++	/* payload: operation (1) + requested EID (1) */
++	uint8_t buf[CTRL_HDR_LEN + 4];
++	uint8_t req_eid;
++
++	if (len < OFF_CTRL_PAYLOAD + 2U) {
++		ctrl_send_cc(ctx, src, msg_tag, iid, MCTP_CTRL_CMD_SET_ENDPOINT_ID,
++			     MCTP_CTRL_CC_ERROR_INVALID_LENGTH);
++		return;
++	}
++
++	req_eid = msg[OFF_CTRL_PAYLOAD + 1U];
++
++	/*
++	 * This endpoint has a fixed EID (libmctp offers no public API to change
++	 * the bus EID at runtime). Accept only a matching or "no-change" (0)
++	 * request; reject anything else with invalid data.
++	 */
++	if (req_eid != 0 && req_eid != ctx->local_eid) {
++		LOG_WRN("Set EID %u rejected (fixed EID %u)", req_eid,
++			ctx->local_eid);
++		ctrl_send_cc(ctx, src, msg_tag, iid,
++			     MCTP_CTRL_CMD_SET_ENDPOINT_ID,
++			     MCTP_CTRL_CC_ERROR_INVALID_DATA);
++		return;
++	}
++
++	buf[OFF_CTRL_PAYLOAD + 0U] = MCTP_CTRL_CC_SUCCESS;
++	buf[OFF_CTRL_PAYLOAD + 1U] = SET_EID_STATUS_ACCEPTED;
++	buf[OFF_CTRL_PAYLOAD + 2U] = ctx->local_eid;
++	buf[OFF_CTRL_PAYLOAD + 3U] = 0; /* EID pool size: none */
++	ctrl_send(ctx, src, msg_tag, iid, MCTP_CTRL_CMD_SET_ENDPOINT_ID, buf,
++		  sizeof(buf));
++}
++
++static void handle_get_eid(struct mctp_control_ctx *ctx, mctp_eid_t src,
++			   uint8_t msg_tag, uint8_t iid)
++{
++	uint8_t buf[CTRL_HDR_LEN + 4];
++
++	buf[OFF_CTRL_PAYLOAD + 0U] = MCTP_CTRL_CC_SUCCESS;
++	buf[OFF_CTRL_PAYLOAD + 1U] = ctx->local_eid;
++	buf[OFF_CTRL_PAYLOAD + 2U] = 0; /* endpoint type: simple, dynamic EID */
++	buf[OFF_CTRL_PAYLOAD + 3U] = 0; /* medium-specific info */
++	ctrl_send(ctx, src, msg_tag, iid, MCTP_CTRL_CMD_GET_ENDPOINT_ID, buf,
++		  sizeof(buf));
++}
++
++static void handle_get_version(struct mctp_control_ctx *ctx, mctp_eid_t src,
++			       uint8_t msg_tag, uint8_t iid)
++{
++	/* completion_code + entry_count + one 4-byte version entry */
++	uint8_t buf[CTRL_HDR_LEN + 2 + 4];
++
++	buf[OFF_CTRL_PAYLOAD + 0U] = MCTP_CTRL_CC_SUCCESS;
++	buf[OFF_CTRL_PAYLOAD + 1U] = 1; /* number of version entries */
++	/* MCTP base spec version 1.3.1, packed BCD with 0xF filler nibble. */
++	buf[OFF_CTRL_PAYLOAD + 2U] = 0xF1; /* major 1 */
++	buf[OFF_CTRL_PAYLOAD + 3U] = 0xF3; /* minor 3 */
++	buf[OFF_CTRL_PAYLOAD + 4U] = 0xF1; /* update 1 */
++	buf[OFF_CTRL_PAYLOAD + 5U] = 0x00; /* alpha: none */
++	ctrl_send(ctx, src, msg_tag, iid, MCTP_CTRL_CMD_GET_VERSION_SUPPORT, buf,
++		  sizeof(buf));
++}
++
++static void handle_get_msg_types(struct mctp_control_ctx *ctx, mctp_eid_t src,
++				 uint8_t msg_tag, uint8_t iid)
++{
++	uint8_t buf[CTRL_HDR_LEN + 2 + CONFIG_MCTP_CONTROL_MAX_MSG_TYPES];
++	size_t n = ctx->num_msg_types;
++
++	if (n > CONFIG_MCTP_CONTROL_MAX_MSG_TYPES) {
++		n = CONFIG_MCTP_CONTROL_MAX_MSG_TYPES;
++	}
++
++	buf[OFF_CTRL_PAYLOAD + 0U] = MCTP_CTRL_CC_SUCCESS;
++	buf[OFF_CTRL_PAYLOAD + 1U] = (uint8_t)n;
++	for (size_t i = 0; i < n; i++) {
++		buf[OFF_CTRL_PAYLOAD + 2U + i] = ctx->msg_types[i];
++	}
++	ctrl_send(ctx, src, msg_tag, iid, MCTP_CTRL_CMD_GET_MESSAGE_TYPE_SUPPORT,
++		  buf, OFF_CTRL_PAYLOAD + 2U + n);
++}
++
++void mctp_control_rx(uint8_t src_eid, bool tag_owner, uint8_t msg_tag,
++		     void *data, void *msg, size_t len)
++{
++	struct mctp_control_ctx *ctx = data;
++	const uint8_t *buf = msg;
++	uint8_t rq_dgram, iid, cmd;
++
++	if (ctx == NULL || buf == NULL || len < CTRL_HDR_LEN) {
++		goto forward;
++	}
++
++	/* Only baseline control-protocol requests are handled here. */
++	if (buf[OFF_MSG_TYPE] != MCTP_MSG_TYPE_CONTROL) {
++		goto forward;
++	}
++
++	rq_dgram = buf[OFF_RQ_DGRAM];
++	if (!(rq_dgram & MCTP_CTRL_HDR_FLAG_REQUEST)) {
++		/* A control response; nothing to do for a pure responder. */
++		return;
++	}
++
++	iid = rq_dgram & MCTP_CTRL_HDR_INSTANCE_ID_MASK;
++	cmd = buf[OFF_CMD_CODE];
++
++	switch (cmd) {
++	case MCTP_CTRL_CMD_SET_ENDPOINT_ID:
++		handle_set_eid(ctx, src_eid, msg_tag, iid, buf, len);
++		return;
++	case MCTP_CTRL_CMD_GET_ENDPOINT_ID:
++		handle_get_eid(ctx, src_eid, msg_tag, iid);
++		return;
++	case MCTP_CTRL_CMD_GET_VERSION_SUPPORT:
++		handle_get_version(ctx, src_eid, msg_tag, iid);
++		return;
++	case MCTP_CTRL_CMD_GET_MESSAGE_TYPE_SUPPORT:
++		handle_get_msg_types(ctx, src_eid, msg_tag, iid);
++		return;
++	default:
++		LOG_DBG("unsupported control cmd 0x%02x from EID %u", cmd,
++			src_eid);
++		ctrl_send_cc(ctx, src_eid, msg_tag, iid, cmd,
++			     MCTP_CTRL_CC_ERROR_UNSUPPORTED_CMD);
++		return;
++	}
++
++forward:
++	if (ctx != NULL && ctx->downstream != NULL) {
++		ctx->downstream(src_eid, tag_owner, msg_tag,
++				ctx->downstream_data, msg, len);
++	}
++}
++
++int mctp_control_responder_init(struct mctp_control_ctx *ctx, struct mctp *mctp,
++				mctp_eid_t eid, const uint8_t *msg_types,
++				size_t num_msg_types, mctp_rx_fn downstream,
++				void *downstream_data)
++{
++	int rc;
++
++	if (ctx == NULL || mctp == NULL) {
++		return -EINVAL;
++	}
++	if (num_msg_types > 0 && msg_types == NULL) {
++		return -EINVAL;
++	}
++
++	ctx->mctp = mctp;
++	ctx->local_eid = eid;
++	ctx->msg_types = msg_types;
++	ctx->num_msg_types = num_msg_types;
++	ctx->downstream = downstream;
++	ctx->downstream_data = downstream_data;
++
++	rc = mctp_set_rx_all(mctp, mctp_control_rx, ctx);
++	if (rc != 0) {
++		return rc;
++	}
++
++	return 0;
++}

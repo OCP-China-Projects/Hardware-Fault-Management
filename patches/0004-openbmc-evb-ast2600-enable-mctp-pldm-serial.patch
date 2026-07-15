@@ -1,0 +1,166 @@
+OpenBMC evb-ast2600: enable MCTP + PLDM with an MCTP-over-serial link
+
+Turns on the DMTF PMCI stack (Code Construct mctpd + OpenBMC pldmd) for the
+QEMU ast2600-evb machine and brings up an MCTP-over-serial (DSP0253) link on
+AST2600 UART1 so the BMC can talk PLDM Type 0 to an external endpoint (a
+Zephyr QEMU instance) over a -serial unix: socket bridge.
+
+Changes
+  * meta-aspeed/conf/machine/evb-ast2600.conf
+      require pldm.inc (chains mctp.inc) -> DISTRO_FEATURES += "mctp pldm",
+      DISTROOVERRIDES += ":df-mctp:df-pldm"; IMAGE_INSTALL:append = " pldm".
+      This pulls packagegroup-obmc-apps-dmtf-pmci (-> mctp) and pldm, and
+      auto-attaches the kernel MCTP fragment (CONFIG_MCTP/_SERIAL) via the
+      df-mctp override on linux-aspeed's SRC_URI.
+  * meta-evb-.../recipes-phosphor/mctp/mctp_%.bbappend (+files)
+      ship mctp-local.service (bus-owner) that runs "mctp link serial
+      /dev/ttyS0", assigns EID 8, route 18, and SetupEndpoint; plus mctpd.conf.
+  * meta-evb-.../recipes-kernel/linux/linux-aspeed_%.bbappend (+patch)
+      df-mctp SRC_URI patch enabling AST2600 UART1 (alias serial0 ->
+      /dev/ttyS0) in aspeed-ast2600-evb.dts; console stays on UART5/ttyS4.
+
+Verified: bitbake obmc-phosphor-image succeeds (5854 tasks); manifest carries
+mctp/pldm/pldmtool/libpldm0; squashfs ships mctpd, pldmd, pldmtool and the
+mctp-local.service wired into mctpd.service.wants; kernel .config has
+CONFIG_MCTP=y / CONFIG_MCTP_SERIAL=y; built DTB shows serial@1e783000 okay.
+
+---
+
+### meta-aspeed/conf/machine/evb-ast2600.conf (modified)
+diff --git a/meta-aspeed/conf/machine/evb-ast2600.conf b/meta-aspeed/conf/machine/evb-ast2600.conf
+index c30cb5c0..dda33163 100644
+--- a/meta-aspeed/conf/machine/evb-ast2600.conf
++++ b/meta-aspeed/conf/machine/evb-ast2600.conf
+@@ -16,6 +16,17 @@ SOCSEC_SIGN_ENABLE = "0"
+ require conf/machine/include/ast2600.inc
+ include conf/machine/include/obmc-evb-common.inc
+ 
++# Enable the DMTF PMCI stack (MCTP + PLDM). pldm.inc chains mctp.inc, which
++# turns on the df-mctp/df-pldm distro overrides. Those in turn make
++# packagegroup-obmc-apps-dmtf-pmci pull in the Code Construct mctp daemon and
++# the OpenBMC pldm daemon, and attach the kernel MCTP/MCTP_SERIAL config
++# fragment. Mirrors the meta-evb-fvp-base machine wiring.
++require conf/distro/include/pldm.inc
++
++IMAGE_INSTALL:append = " \
++    pldm \
++"
++
+ SERIAL_CONSOLES = "115200;ttyS4"
+ 
+ # AST2600 EVB has 64MB SPI flash
+
+### new files under meta-evb/meta-evb-aspeed/meta-evb-ast2600 (recipes-phosphor + recipes-kernel)
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0001-aspeed-ast2600-evb-enable-uart1-for-mctp-serial.patch b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0001-aspeed-ast2600-evb-enable-uart1-for-mctp-serial.patch
+new file mode 100644
+index 00000000..078359c3
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0001-aspeed-ast2600-evb-enable-uart1-for-mctp-serial.patch
+@@ -0,0 +1,34 @@
++From: HFM <hfm@example.com>
++Date: Mon, 7 Jul 2026 00:00:00 +0000
++Subject: [PATCH] ARM: dts: aspeed: ast2600-evb: enable UART1 for MCTP serial
++
++The AST2600 EVB devicetree only enables UART5 (the console, ttyS4).
++To carry an MCTP-over-serial (DSP0253) link to an external endpoint we
++need a second UART exposed to userspace. QEMU's ast2600-evb model wires
++the second -serial chardev to UART1, which Linux enumerates as ttyS0
++(serial0 alias). Enable it so `mctp link serial /dev/ttyS0` has a device
++to attach to.
++
++Upstream-Status: Inappropriate [ast2600-evb QEMU MCTP-serial demo config]
++
++Signed-off-by: HFM <hfm@example.com>
++---
++ arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts | 4 ++++
++ 1 file changed, 4 insertions(+)
++
++diff --git a/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts b/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
++--- a/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
+++++ b/arch/arm/boot/dts/aspeed/aspeed-ast2600-evb.dts
++@@ -205,8 +205,12 @@
++ &uart5 {
++ 	// Workaround for A0
++ 	compatible = "snps,dw-apb-uart";
++ };
++ 
+++&uart1 {
+++	status = "okay";
+++};
+++
++ &i2c0 {
++ 	status = "okay";
++ };
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend
+new file mode 100644
+index 00000000..d599b716
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend
+@@ -0,0 +1,7 @@
++FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
++
++# Enable AST2600 UART1 (Linux /dev/ttyS0, alias serial0) on the EVB so it can
++# carry an MCTP-over-serial link to an external endpoint. QEMU's ast2600-evb
++# model routes the second -serial backend to UART1; the stock EVB devicetree
++# leaves UART1 disabled, so add a fragment that turns it on.
++SRC_URI:append:df-mctp = " file://0001-aspeed-ast2600-evb-enable-uart1-for-mctp-serial.patch"
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
+new file mode 100644
+index 00000000..533df4cb
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
+@@ -0,0 +1,18 @@
++[Unit]
++Description=MCTP configuration for serial ttyS0 (AST2600 UART1)
++After=mctpd.service
++Before=pldmd.service
++BindsTo=mctpd.service
++
++[Service]
++Type=simple
++ExecStartPre=stty -F /dev/ttyS0 115200 litout -crtscts -ixon -echo raw
++ExecStart=mctp link serial /dev/ttyS0
++ExecStartPost=sleep 3
++ExecStartPost=mctp link set mctpserial0 up
++ExecStartPost=mctp addr add 8 dev mctpserial0
++ExecStartPost=mctp route add 18 via mctpserial0
++ExecStartPost=busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0
++
++[Install]
++WantedBy=mctpd.service
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctpd.conf b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctpd.conf
+new file mode 100644
+index 00000000..03c46e6c
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctpd.conf
+@@ -0,0 +1,6 @@
++# Mode: either bus-owner, endpoint or unknown
++mode = "bus-owner"
++
++# MCTP protocol configuration. Used for both endpoint and bus-owner modes.
++[mctp]
++message_timeout_ms = 5000
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend
+new file mode 100644
+index 00000000..14948b17
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend
+@@ -0,0 +1,18 @@
++FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
++
++# Bring up an MCTP-over-serial (DSP0253) link on the AST2600 EVB so the BMC
++# can speak PLDM to an external endpoint reachable over a UART. The second
++# QEMU -serial backend is wired to AST2600 UART1, which Linux exposes as
++# /dev/ttyS0 (serial0 alias). Modeled on meta-evb-fvp-base.
++SRC_URI:append = " \
++  file://mctp-local.service \
++  file://mctpd.conf \
++"
++
++SYSTEMD_SERVICE:${PN} += "mctp-local.service"
++
++do_install:append() {
++    install -m 0644 ${UNPACKDIR}/mctp-local.service ${D}${systemd_system_unitdir}/
++    install -d ${D}/etc/
++    install -m 0644 ${UNPACKDIR}/mctpd.conf ${D}/etc/mctpd.conf
++}

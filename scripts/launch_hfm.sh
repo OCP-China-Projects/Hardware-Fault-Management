@@ -8,6 +8,11 @@ export LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu:$HOME/local/lib${LD_LIBR
 [ -x "${QEMU_RISCV_BIN}" ] || QEMU_RISCV_BIN=qemu-system-riscv64
 ZEPHYR_IMG=zephyr.elf
 
+# Second UART (SiFive uart1) carries the MCTP-over-serial (DSP0253) link to the
+# OpenBMC instance. Zephyr is the socket client; launch_openbmc.sh (the server)
+# must be started first so the socket exists.
+MCTP_SOCK=${MCTP_SOCK:-/tmp/hfm-mctp.sock}
+
 CPUS=2
 MEMORY=256
 MACHINE=sifive_u
@@ -39,7 +44,8 @@ ${QEMU_RISCV_BIN} \
     -m ${MEMORY} \
     -bios none \
     -kernel ${PREBUILTS_DIR}/${ZEPHYR_IMG} \
-    -serial mon:stdio
+    -serial mon:stdio \
+    -serial unix:${MCTP_SOCK}
 
 echo "Cleaning up"
 rm ${PREBUILTS_DIR}/${ZEPHYR_IMG}
