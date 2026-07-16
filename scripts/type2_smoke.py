@@ -26,14 +26,23 @@ import subprocess
 import time
 
 HOME = os.path.expanduser("~")
-QEMU_ARM = f"{HOME}/qemu-build/bin/qemu-system-arm"
-QEMU_RV = f"{HOME}/qemu-build/bin/qemu-system-riscv64"
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+QEMU_ARM = os.environ.get("QEMU_ARM", f"{HOME}/qemu-build/bin/qemu-system-arm")
+QEMU_RV = os.environ.get("QEMU_RV", f"{HOME}/qemu-build/bin/qemu-system-riscv64")
 SOCK = "/tmp/hfm-mctp-t2.sock"
 
-# Fresh artifacts (this session's builds), not the stale git-tracked prebuilts.
-ZEPHYR_ELF = "/data00/home/terry.gong/zephyrproject/zephyr/build-type2/zephyr/zephyr.elf"
-OBMC_DEPLOY = ("/data00/home/terry.gong/oss/openbmc/build/tmp/deploy/images/"
-               "evb-ast2600/obmc-phosphor-image-evb-ast2600.static.mtd")
+# Type 2 needs the freshly built artifacts (the Type 2 responder + the OpenBMC
+# image whose mctp-local.service does auto-discovery). Point at them via the
+# environment; sensible defaults fall back to the repo prebuilts so the script
+# runs on any machine without editing hardcoded /home/<user> paths.
+#   ZEPHYR_ELF  - Zephyr build with the Type 2 responder (build-type2/.../zephyr.elf)
+#   OBMC_DEPLOY - OpenBMC deploy image with auto-discovery mctp-local.service
+ZEPHYR_ELF = os.environ.get(
+    "ZEPHYR_ELF", os.path.join(REPO_ROOT, "prebuilts", "zephyr.elf"))
+OBMC_DEPLOY = os.environ.get(
+    "OBMC_DEPLOY",
+    os.path.join(REPO_ROOT, "prebuilts",
+                 "obmc-phosphor-image-evb-ast2600.mtd"))
 OBMC_IMG = "/tmp/obmc-type2.mtd"  # writable scratch copy
 
 ZEPHYR_LOG = "/tmp/zephyr-t2.log"
@@ -108,7 +117,15 @@ def run(cmd, timeout=60):
 try:
     print(f"[*] resolving OpenBMC deploy image: "
           f"{os.path.realpath(OBMC_DEPLOY)}", flush=True)
-    shutil.copyfile(OBMC_DEPLOY, OBMC_IMG)
+    # If only the compressed .mtd.gz is present (fresh clone), decompress it
+    # into the writable scratch copy; otherwise copy the raw image as-is.
+    if not os.path.exists(OBMC_DEPLOY) and os.path.exists(OBMC_DEPLOY + ".gz"):
+        import gzip
+        print(f"[*] decompressing {OBMC_DEPLOY}.gz -> {OBMC_IMG}", flush=True)
+        with gzip.open(OBMC_DEPLOY + ".gz", "rb") as src, open(OBMC_IMG, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    else:
+        shutil.copyfile(OBMC_DEPLOY, OBMC_IMG)
     print(f"[*] scratch image: {OBMC_IMG} "
           f"({os.path.getsize(OBMC_IMG)} bytes)", flush=True)
 

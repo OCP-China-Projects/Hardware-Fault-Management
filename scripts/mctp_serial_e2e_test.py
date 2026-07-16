@@ -19,9 +19,20 @@ import sys
 import time
 
 SOCK = "/tmp/hfm-mctp-test.sock"
-ELF = sys.argv[1] if len(sys.argv) > 1 else \
-    "/home/terry.gong/workspace/Hardware-Fault-Management/prebuilts/zephyr.elf"
-QEMU = os.path.expanduser("~/qemu-build/bin/qemu-system-riscv64")
+# ELF path: argv[1] > $ZEPHYR_ELF > repo prebuilts/zephyr.elf. If only the
+# compressed prebuilts/zephyr.elf.gz is present (fresh clone), decompress it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ELF = (sys.argv[1] if len(sys.argv) > 1
+       else os.environ.get("ZEPHYR_ELF",
+                           os.path.join(_REPO_ROOT, "prebuilts", "zephyr.elf")))
+if not os.path.exists(ELF) and os.path.exists(ELF + ".gz"):
+    import gzip
+    import shutil
+    print(f"[*] decompressing {ELF}.gz -> {ELF}", flush=True)
+    with gzip.open(ELF + ".gz", "rb") as src, open(ELF, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+QEMU = os.environ.get("QEMU_RV",
+                      os.path.expanduser("~/qemu-build/bin/qemu-system-riscv64"))
 
 BMC_EID = 8
 ZEPHYR_EID = 18

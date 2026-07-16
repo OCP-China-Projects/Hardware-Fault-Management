@@ -98,15 +98,20 @@ packages.
 
 ### Build QEMU 11 from source
 
-Source location on this machine:
-[/data00/home/terry.gong/qemu-11-src](file:///data00/home/terry.gong/qemu-11-src)
-(release tarball extracted from `https://download.qemu.org/`).
+Download and extract the pinned release tarball from
+`https://download.qemu.org/` (this project uses 11.0.0):
 
 QEMU 11 depends on **glib >= 2.66** (uses `g_uri_parse_params`). Ubuntu
 20.04 ships glib 2.64, so we install a newer glib into `$HOME/local`
 first and point QEMU at it via `LD_LIBRARY_PATH`.
 
 ```shell
+# 0. Fetch and unpack QEMU 11.0.0
+QEMU_SRC=$HOME/qemu-11-src
+wget https://download.qemu.org/qemu-11.0.0.tar.xz
+mkdir -p "$QEMU_SRC"
+tar xf qemu-11.0.0.tar.xz -C "$QEMU_SRC" --strip-components=1
+
 # 1. Build glib >= 2.66 into $HOME/local (only needed on Ubuntu 20.04)
 GLIB_VER=2.78.6
 wget https://download.gnome.org/sources/glib/2.78/glib-${GLIB_VER}.tar.xz
@@ -115,21 +120,21 @@ meson setup _build --prefix=$HOME/local -Dtests=false
 ninja -C _build install
 cd ..
 
-# 2. Configure and build QEMU 11 for the targets we need
-cd /data00/home/terry.gong/qemu-11-src
-python3 -m venv pyvenv
-./pyvenv/bin/pip install meson==1.10.0 ninja
-mkdir -p build && cd build
+# 2. Configure and build QEMU 11 for the targets we need.
+#    QEMU ships its own ./configure wrapper (it drives meson internally),
+#    so use that rather than calling `meson setup` directly — meson does
+#    not understand QEMU's --target-list flag.
+cd "$QEMU_SRC"
 
 PKG_CONFIG_PATH=$HOME/local/lib/x86_64-linux-gnu/pkgconfig \
 LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu \
-../pyvenv/bin/meson setup .. \
+./configure \
     --prefix=$HOME/qemu-build \
     --target-list=riscv64-softmmu,arm-softmmu,aarch64-softmmu \
-    -Ddocs=disabled -Dgtk=disabled -Dsdl=disabled
+    --disable-docs --disable-gtk --disable-sdl
 
-ninja
-ninja install
+make -j"$(nproc)"
+make install
 ```
 
 Result: `$HOME/qemu-build/bin/qemu-system-{riscv64,arm,aarch64}` (each
@@ -176,10 +181,29 @@ Board metadata:
 
 ### Build Zephyr for `qemu_riscv64` and boot it
 
+> **Toolchain prerequisites (Ubuntu 20.04).** Zephyr v4.3 requires
+> **Python >= 3.10** and **CMake >= 3.20**. Ubuntu 20.04 ships Python 3.8
+> and CMake 3.16, so build the venv with a newer interpreter and install
+> a recent CMake before `west build`:
+>
+> ```shell
+> # Use a Python >= 3.10 interpreter for the venv (build your own or use
+> # a distro backport such as the deadsnakes PPA).
+> python3.12 -m venv $HOME/zephyrproject/.venv
+> source $HOME/zephyrproject/.venv/bin/activate
+> pip install --upgrade pip
+> pip install cmake        # pulls CMake >= 3.20 into the venv
+> cmake --version          # confirm >= 3.20
+> ```
+>
+> Ubuntu 22.04+ already ships Python 3.10+/CMake 3.22+, so this step is
+> only needed on 20.04.
+
 ```shell
 export ZEPHYR_DIR=$HOME/zephyrproject
 
-# west + venv (skip if already provisioned)
+# west + venv (skip if already provisioned).
+# NOTE: create the venv with Python >= 3.10 (see prerequisite box above).
 python3 -m venv $ZEPHYR_DIR/.venv
 source $ZEPHYR_DIR/.venv/bin/activate
 pip install west --break-system-packages || true
@@ -189,6 +213,8 @@ cd $ZEPHYR_DIR
 west update
 west zephyr-export
 cd zephyr
+# Install the Python build dependencies Zephyr needs at configure time.
+pip install -r scripts/requirements.txt
 west sdk install
 
 # Build the hello_world sample for qemu_riscv64
@@ -215,9 +241,10 @@ Hello World! qemu_riscv64/qemu_virt_riscv64
 
 ### Legacy: hifive_unmatched (`sifive_u` machine)
 
-The prebuilt HFM ELF `prebuilts/zephyr.elf` targets
-`hifive_unmatched/fu740/u74` and is preserved for backwards
-compatibility. Two patches are required to boot it under QEMU 11
+The prebuilt HFM ELF `prebuilts/zephyr.elf` is the **serial_bridge**
+sample built for `hifive_unleashed/fu540/u54` (it boots under QEMU's
+`sifive_u` machine and carries the PLDM Type 0 + Type 2 responders,
+EID 18). Two patches are required to boot it under QEMU 11
 because `sifive_u` is a partial FU540/FU740 model:
 
 - [patches/zephyr-fu700-pll-lock-qemu-timeout.patch](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/zephyr-fu700-pll-lock-qemu-timeout.patch)
@@ -293,13 +320,14 @@ The two required edits are captured in
        select DW_I3C
    ```
 
-Rebuild QEMU:
+Rebuild QEMU (from the QEMU source top; `make` re-runs meson as needed):
 
 ```shell
-cd /data00/home/terry.gong/qemu-11-src/build
-../pyvenv/bin/meson --internal regenerate . ..
-ninja qemu-system-riscv64
-cp qemu-system-riscv64 $HOME/qemu-build/bin/
+cd "$QEMU_SRC"
+PKG_CONFIG_PATH=$HOME/local/lib/x86_64-linux-gnu/pkgconfig \
+LD_LIBRARY_PATH=$HOME/local/lib/x86_64-linux-gnu \
+make -j"$(nproc)"
+make install
 ```
 
 Verify the device is registered:
@@ -504,6 +532,15 @@ https://$TARGETIP:1443
 Requires ~50 GB free disk and 3–8 hours. Yocto downloads several GB of
 source archives on the first run.
 
+> **Important — apply the HFM patches.** The stock `obmc-phosphor-image`
+> for `evb-ast2600` ships **no** mctp/pldm binaries. You must apply
+> patches **0004** (enable MCTP + PLDM over serial) and **0006** (mctpd
+> auto-discovery delta) from `patches/` *before*
+> `bitbake`, or the resulting image cannot run Part 4 (no `mctpd`,
+> `pldmd`, `mctp`, or `pldmtool`). The prebuilt shipped in
+> `prebuilts/obmc-phosphor-image-evb-ast2600.mtd.gz` is already patched
+> — rebuild from scratch only if you need to change the stack.
+
 ```shell
 git clone https://github.com/openbmc/openbmc.git openbmc
 
@@ -514,6 +551,10 @@ sudo sysctl -w kernel.unprivileged_userns_clone=1
 
 cd openbmc
 git checkout 2.18.0 -b 2.18.0
+
+# Apply the HFM Yocto-layer patches (enable mctp/pldm + auto-discovery).
+git am ../patches/0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch
+git am ../patches/0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch
 
 # bitbake 2.12 requires Python 3.9+. Ubuntu 20.04 ships 3.8 as
 # `python3`, so add a shim that points `python3` at 3.9 for this shell:
@@ -539,5 +580,17 @@ patch -p1 < ../patches/openbmc-bitbake-disable_network-erofs.patch
 The MTD image lands at:
 
 ```
-$OPENBMC_CODE_BASE/build/evb-ast2600/tmp/deploy/images/evb-ast2600/obmc-phosphor-image-evb-ast2600-$BUILD_TIME.static.mtd
+$OPENBMC_CODE_BASE/build/tmp/deploy/images/evb-ast2600/obmc-phosphor-image-evb-ast2600-$BUILD_TIME.static.mtd
 ```
+
+To use it as the prebuilt for `launch_openbmc.sh` / `two_qemu_smoke.py`,
+gzip the `.static.mtd` into `prebuilts/` under the expected name:
+
+```shell
+gzip -c -9 \
+  build/tmp/deploy/images/evb-ast2600/obmc-phosphor-image-evb-ast2600.static.mtd \
+  > prebuilts/obmc-phosphor-image-evb-ast2600.mtd.gz
+```
+
+`launch_openbmc.sh` gunzips it on startup; the smoke scripts decompress
+to a writable scratch copy automatically.
