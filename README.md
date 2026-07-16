@@ -254,6 +254,13 @@ because `sifive_u` is a partial FU540/FU740 model:
   — redirects `zephyr,sram` to DDR and shrinks `ram0` so heap init
   does not fault above `-m 256`.
 
+A second prebuilt, `prebuilts/zephyr-debug.elf`, is the same serial_bridge
+firmware rebuilt with `docs/demo/debug.conf` layered on top (MCTP + PLDM at
+`DEBUG`, `CONFIG_LOG_MODE_IMMEDIATE=y`). It carries the identical fixes, so
+auto-discovery still succeeds, but prints the full boot / init / MCTP / PLDM
+trace. The demo's `scripts/launch_hfm.sh` selects it with
+`./launch_hfm.sh debug` (see `docs/demo/README.md`).
+
 ```shell
 patch -p1 -d zephyr < ../../patches/zephyr-fu700-pll-lock-qemu-timeout.patch
 west build -b hifive_unmatched/fu740/u74 -p always samples/hello_world/ \

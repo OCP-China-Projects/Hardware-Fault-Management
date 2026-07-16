@@ -18,7 +18,7 @@ machine.
 ## Demo flow (three SSH terminals)
 
 1. **Terminal 1** — `./launch_openbmc.sh` — boot OpenBMC (socket server, start first).
-2. **Terminal 2** — `./launch_hfm.sh` — boot Zephyr (socket client); watch the boot + `-116` retries, then the reverse probe complete on its own.
+2. **Terminal 2** — `./launch_hfm.sh` — boot Zephyr (socket client); watch the boot + `-116` retries, then the reverse probe complete on its own. Add `debug` (`./launch_hfm.sh debug`) to boot the verbose firmware instead — see *Firmware variants* below.
 3. **Terminal 3** — `./drive_bmc_pldm.sh` — show the auto-discovered route (`mctp route` has EID 18), then forward PLDM (`GetTID` / `GetPDR` / `GetSensorReading` …).
 4. Back on **Terminal 2**, watch `Reverse-direction PLDM probe to BMC complete` (reverse path, patch 0009).
 
@@ -33,6 +33,29 @@ machine.
 Terminals 1 and 2 use `-serial mon:stdio`, so both QEMU boots are visible in
 their own terminal. See `DEMO_GUIDE.md` for the full script, expected output,
 and troubleshooting.
+
+## Firmware variants (release vs debug)
+
+`launch_hfm.sh` can boot either Zephyr firmware image; both carry the same
+fixes (reverse-path TO=1 patch 0009 and control-responder TO=0 patch 0011), so
+auto-discovery succeeds with either.
+
+| Variant | Firmware | Logging | Use for |
+|---|---|---|---|
+| `release` (default) | `prebuilts/zephyr.elf` | MCTP/PLDM at INFO | the demo / the validated MR artifact |
+| `debug` | `prebuilts/zephyr-debug.elf` | MCTP/PLDM at DEBUG + immediate (synchronous) logging | inspecting the full boot / init / MCTP / PLDM sequence |
+
+```shell
+./launch_hfm.sh            # release (default)
+./launch_hfm.sh debug      # verbose firmware
+ZEPHYR_VARIANT=debug ./launch_hfm.sh
+```
+
+The `debug` build adds kernel thread/scheduler traces, MCTP control-message
+decode lines, and per-request PLDM `type/cmd/rc` — handy for showing "what
+Zephyr is actually doing" during a walkthrough. It is a bit slower because
+every log line is flushed synchronously to the console, but the reverse probe
+still completes on its own (verified: `GetTID -> 0x01` on try 2).
 
 ## Notes
 
