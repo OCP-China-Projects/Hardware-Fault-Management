@@ -104,7 +104,7 @@ facts = [
     ("Requester", "OpenBMC pldmd / mctpd — EID 8"),
     ("Responder", "Zephyr serial_bridge — EID 18"),
     ("Transport", "MCTP-over-serial (DSP0253) via unix socket"),
-    ("Result", "Fwd + reverse PLDM verified (rc=0)"),
+    ("Result", "Auto-discovery + fwd/reverse PLDM (rc=0)"),
 ]
 x = 0.9
 for lab, val in facts:
@@ -126,7 +126,7 @@ items = [
     ("3", "The realized topology", "Two QEMU instances bridged over MCTP-serial (DSP0253)"),
     ("4", "Live demo — forward discovery", "OpenBMC pldmtool drives PLDM Type 0/2 against Zephyr EID 18"),
     ("5", "Live demo — reverse path (patch 0009)", "Zephyr requester \u2192 BMC responder, tag-owner bit fix"),
-    ("6", "Known limitation & wrap-up", "mctpd auto-discovery kernel busy-loop; what ships in RASAPI"),
+    ("6", "Full auto-discovery — three fixes & wrap-up", "kernel busy-loop (0010) + control TO bit (0011) + systemd order (0006)"),
 ]
 y = 1.75
 for num, title, sub in items:
@@ -184,7 +184,7 @@ for i, (lab, col) in enumerate(layers):
         text(s, 6.4, y+0.66, 0.6, 0.3, [[R("\u25bc", 12, GREY)]], align=PP_ALIGN.CENTER)
     y += 0.82
 text(s, 0.7, 6.7, 12, 0.4,
-     [[R("Delivered as numbered patches 0001–0009 under patches/ — full apply order in patches/README.md", 13, GREY, italic=True)]])
+     [[R("Delivered as numbered patches 0001–0011 under patches/ — full apply order in patches/README.md", 13, GREY, italic=True)]])
 footer(s, 4)
 
 # ============================================================ Slide 5 — Topology diagram
@@ -226,10 +226,10 @@ header(s, "PREREQUISITES", "What is already built on the dev machine")
 rows = [
     ("Component", "Location / artifact", "Verify", True),
     ("QEMU 11.0.0", "~/qemu-build/bin/qemu-system-{arm,riscv64}", "runs -machine help", False),
-    ("OpenBMC image", "obmc-phosphor-image-evb-ast2600.static.mtd", "md5 c775fa9", False),
-    ("Zephyr ELF (+0009)", "build-serial-0009/zephyr/zephyr.elf", "md5 14b701bc", False),
+    ("OpenBMC image (+0004/6/10)", "obmc-phosphor-image-evb-ast2600.static.mtd", "md5 9a858c13", False),
+    ("Zephyr ELF (+0009/0011)", "build-serial-fix/zephyr/zephyr.elf", "md5 dd56e8fe", False),
     ("Test harness", "/tmp/hfm-verify/ (scripts + prebuilts)", "two_qemu_smoke.py", False),
-    ("Launcher", "/tmp/run_pldm3.sh  \u2192  /tmp/pldm_comm_test3.out", "PYTHON_EXIT=0", False),
+    ("Launcher", "launch_openbmc.sh / launch_hfm.sh", "cold-boot auto-discovery", False),
 ]
 y = 1.8
 colx = [0.7, 3.7, 9.9]
@@ -256,8 +256,8 @@ cols = [
      ["cd /tmp/hfm-verify/scripts", "./launch_openbmc.sh", "# press Enter, watch", "# AST2600 boot -> login:"]),
     ("Terminal 2", ACCENT, "Zephyr QEMU", "socket client",
      ["cd /tmp/hfm-verify/scripts", "./launch_hfm.sh", "# press Enter, watch", "# boot + reverse probe"]),
-    ("Terminal 3", GREEN, "Drive PLDM", "forward + reverse prep",
-     ["cd /tmp/hfm-verify/scripts", "./drive_bmc_pldm.sh", "# forward pldmtool", "# starts EID 8 responder"]),
+    ("Terminal 3", GREEN, "Drive PLDM", "observe auto-route + forward",
+     ["cd /tmp/hfm-verify/scripts", "./drive_bmc_pldm.sh", "# auto-discovered route", "# forward pldmtool"]),
 ]
 x = 0.7
 for name, col, role, sub, lines in cols:
@@ -298,13 +298,13 @@ text(s, 7.15, 2.42, 5.1, 1.5, [
     [C("*** Booting Zephyr OS v4.3.0 ***", 12.5, WHITE)],
     [C("serial_bridge: EID 18 ... ready", 12.5, WHITE)],
     [C("BMC GetTID try 1 rc=-116, retrying", 12, AMBER)],
-    [C("  ^ retries until T3 brings the link up", 11.5, GREY)],
+    [C("  ^ retries until mctpd auto-discovers", 11.5, GREY)],
 ], line_spacing=1.12)
 text(s, 7.0, 4.15, 5.4, 2.0, [
     [R("• Zephyr = EID 18: PLDM Type 0/2 + MCTP control responder.", 13, WHITE)],
     [R("• Its requester thread probes the BMC and retries (-116) —", 13, WHITE)],
-    [R("  normal until the BMC link + responder come up in T3.", 13, GREY)],
-    [R("• Keep this terminal in view for the reverse-path result.", 13, WHITE)],
+    [R("  normal until mctpd finishes auto-discovery (SetupEndpoint).", 13, GREY)],
+    [R("• Then the reverse probe completes on its own — watch here.", 13, WHITE)],
 ], line_spacing=1.12)
 footer(s, 8)
 
@@ -313,18 +313,18 @@ s = prs.slides.add_slide(BLANK); bg(s)
 header(s, "LIVE DEMO · STEP 3 (Terminal 3)", "Forward path — BMC discovers & polls Zephyr")
 box(s, 0.7, 1.7, 11.95, 2.9, fill=CODEBG, line=GREEN, line_w=1.0)
 text(s, 0.95, 1.82, 11.5, 2.7, [
+    [C("BMC# mctp route          # installed by mctpd, not by hand", 14.5, ACCENT)],
+    [C("        eid min 18 max 18 net 1 dev mctpserial0 mtu 68", 14, GREEN)],
     [C("BMC# pldmtool base GetTID -m 18", 14.5, ACCENT)],
     [C("        GetTID rc=0            \u2192  Response: 1", 14, GREEN)],
     [C("BMC# pldmtool base GetPLDMTypes -m 18", 14.5, ACCENT)],
     [C("        GetPLDMTypes rc=0      \u2192  base(0) + platform(2)", 14, GREEN)],
-    [C("BMC# pldmtool base GetPLDMVersion -m 18 -t 0", 14.5, ACCENT)],
-    [C("        GetPLDMVersion rc=0    \u2192  1.1.0", 14, GREEN)],
     [C("BMC# pldmtool platform GetPDR -m 18 -d 0", 14.5, ACCENT)],
     [C("        Terminus Locator PDR, recordHandle 1, TID 1, EID 18", 14, GREEN)],
     [C("BMC# pldmtool platform GetSensorReading -m 18 -i 1 --rearm 0", 14.5, ACCENT)],
     [C("        presentReading 31, Sensor Enabled, Sensor Normal", 14, GREEN)],
 ], line_spacing=1.05)
-text(s, 0.7, 4.8, 12, 0.5, [[R("drive_bmc_pldm.sh runs these over SSH \u2014 the REAL OpenBMC kernel AF_MCTP stack + pldmtool.", 14, WHITE)]])
+text(s, 0.7, 4.8, 12, 0.5, [[R("mctpd auto-installed the EID-18 route (no manual route add); drive_bmc_pldm.sh then polls over the REAL kernel AF_MCTP stack.", 13.5, WHITE)]])
 box(s, 0.7, 5.4, 11.95, 1.1, fill=STEEL)
 text(s, 0.95, 5.5, 11.5, 0.95, [
     [R("Point out: ", 14, AMBER, True), R("GetPDR returns a real Terminus Locator PDR and the sensor reading (die-temp = 31\u00b0C) — this is Hardware Fault Management telemetry actually flowing over the wire.", 14, WHITE)],
@@ -351,31 +351,30 @@ text(s, 7.0, 2.2, 5.45, 1.75, [
 ], line_spacing=1.1)
 box(s, 0.7, 4.15, 11.95, 2.05, fill=CODEBG, line=GREEN, line_w=1.0)
 text(s, 0.95, 4.27, 11.5, 1.9, [
-    [C("Zephyr console:", 13.5, GREY)],
-    [C("<inf> serial_bridge: BMC GetTID -> 0x08", 14, GREEN)],
-    [C("<inf> serial_bridge: BMC GetPLDMTypes -> byte0=0x01", 14, GREEN)],
-    [C("<inf> serial_bridge: BMC GetPLDMVersion(BASE) -> 0.0.1", 14, GREEN)],
+    [C("Zephyr console (answered by the stock BMC pldmd, no manual responder):", 13.5, GREY)],
+    [C("<inf> serial_bridge: BMC GetTID -> 0x01", 14, GREEN)],
+    [C("<inf> serial_bridge: BMC GetPLDMTypes -> byte0=0x1d", 14, GREEN)],
+    [C("<inf> serial_bridge: BMC GetPLDMVersion(BASE) -> 1.0.0", 14, GREEN)],
     [C("<inf> serial_bridge: Reverse-direction PLDM probe to BMC complete", 14, GREEN)],
-    [C("BMC responder: RX from EID 18 tag 0x08  (TO bit set) \u2192 rx=3 / tx=3", 13.5, ACCENT)],
 ], line_spacing=1.06)
 footer(s, 10)
 
-# ============================================================ Slide 11 — Known limitation
+# ============================================================ Slide 11 — Full auto-discovery
 s = prs.slides.add_slide(BLANK); bg(s)
-header(s, "HONEST STATUS", "Known limitation & what actually ships")
-box(s, 0.7, 1.7, 11.95, 2.15, fill=STEEL, line=AMBER, line_w=1.0)
-text(s, 0.95, 1.82, 11.5, 0.4, [[R("mctpd fully-automatic discovery is blocked by a kernel bug (not our code)", 15, AMBER, True)]])
-text(s, 0.95, 2.3, 11.5, 1.5, [
-    [R("The BMC image kernel (6.6.92) has an AF_MCTP netlink-dump busy-loop: mctpd calls fill_linkmap() (RTM_GETLINK | NLM_F_DUMP) at startup, the dump spins, and the event loop never advances — so automatic SetupEndpoint never completes and the mctp route/addr CLI dump paths hang too.", 13.5, WHITE)],
-    [R("Workaround used in the demo: install the EID-18 route with a raw-netlink helper (RTM_NEWROUTE — sets, never dumps), then address EID 18 directly with pldmtool. Every command answers correctly over the real kernel transport.", 13.5, WHITE)],
-], line_spacing=1.12)
-box(s, 0.7, 4.05, 11.95, 2.25, fill=STEEL)
-text(s, 0.95, 4.17, 11.5, 0.4, [[R("What is proven vs. what awaits an upstream kernel fix", 15, ACCENT, True)]])
-text(s, 0.95, 4.65, 11.5, 1.6, [
-    [R("\u2713  ", 14, GREEN, True), R("PLDM Type 0/2 responders + MCTP control responder — correct over real AF_MCTP", 14, WHITE)],
-    [R("\u2713  ", 14, GREEN, True), R("Forward discovery/polling and reverse-path requester (patch 0009) — both verified", 14, WHITE)],
-    [R("\u2713  ", 14, GREEN, True), R("QEMU 11 + Zephyr rebuilt from source; OpenBMC bitbake reproduces c775fa9", 14, WHITE)],
-    [R("\u25cb  ", 14, AMBER, True), R("Hands-off mctpd self-discovery — needs a kernel with a working AF_MCTP dump", 14, GREY)],
+header(s, "FULL AUTO-DISCOVERY", "Three fixes that make mctpd self-discover at boot")
+box(s, 0.7, 1.7, 11.95, 2.5, fill=STEEL, line=GREEN, line_w=1.0)
+text(s, 0.95, 1.82, 11.5, 0.4, [[R("Cold boot, zero manual steps — mctpd finds EID 18 on its own", 15, GREEN, True)]])
+text(s, 0.95, 2.3, 11.5, 1.85, [
+    [R("1.  ", 13.5, ACCENT, True), R("Kernel (patch 0010): ", 13.5, ACCENT, True), R("6.6.92's for_each_netdev_dump() used xa_for_each_start(), whose cursor never advances at end-of-walk — so the AF_MCTP address dump (mctp_dump_addrinfo) never emits NLMSG_DONE and mctpd spins at 100% CPU. Backport upstream cfa7fa02078d.", 13.5, WHITE)],
+    [R("2.  ", 13.5, ACCENT, True), R("Zephyr control responder (patch 0011): ", 13.5, ACCENT, True), R("control replies wrongly set TO = 1; the BMC kernel treats them as new requests and the mctpd physical-addressing discovery query times out. Reply with TO = 0.", 13.5, WHITE)],
+    [R("3.  ", 13.5, ACCENT, True), R("BMC systemd order (patch 0006): ", 13.5, ACCENT, True), R("mctpd snapshots the link table once at startup, so the serial link must exist first. Split into mctp-local.service (Before mctpd) + mctp-setup-endpoint.service (After mctpd).", 13.5, WHITE)],
+], line_spacing=1.1)
+box(s, 0.7, 4.4, 11.95, 1.9, fill=STEEL)
+text(s, 0.95, 4.52, 11.5, 0.4, [[R("Verified end to end on a from-recipe rebuild", 15, ACCENT, True)]])
+text(s, 0.95, 5.0, 11.5, 1.3, [
+    [R("\u2713  ", 14, GREEN, True), R("mctp-local \u2192 mctpd \u2192 mctp-setup-endpoint all active; SetupEndpoint succeeds, endpoints/18 published on D-Bus", 14, WHITE)],
+    [R("\u2713  ", 14, GREEN, True), R("mctpd auto-installs the kernel route (eid 18 dev mctpserial0); forward pldmtool GetTID/PDR/Sensor all rc=0", 14, WHITE)],
+    [R("\u2713  ", 14, GREEN, True), R("Reverse probe (patch 0009) completes on its own — answered by the stock pldmd, no manual responder", 14, WHITE)],
 ], line_spacing=1.16)
 footer(s, 11)
 
@@ -385,7 +384,7 @@ header(s, "RECAP", "The whole demo — three terminals")
 cmds = [
     ("T1:  ./launch_openbmc.sh", "boot OpenBMC (server) \u2192 login:"),
     ("T2:  ./launch_hfm.sh", "boot Zephyr (client), watch retries"),
-    ("T3:  ./drive_bmc_pldm.sh", "forward pldmtool + start responder"),
+    ("T3:  ./drive_bmc_pldm.sh", "observe auto-route + forward pldmtool"),
     ("T3 output:  GetTID/PDR/Sensor rc=0", "forward path verified"),
     ("T2 output:  'Reverse-direction ... complete'", "reverse path (patch 0009)"),
 ]

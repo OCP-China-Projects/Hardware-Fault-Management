@@ -1,8 +1,14 @@
 # Local MR set — MCTP bindings + PLDM (Type 0 & Type 2) for Zephyr, and MCTP/PLDM for OpenBMC
 
-The OCP HFM prototype is delivered as nine numbered patches split across two
+The OCP HFM prototype is delivered as eleven numbered patches split across two
 trees. Zephyr patches stack on tag `v4.3.0`; OpenBMC patches are Yocto-layer
 diffs rooted at the OpenBMC tree top.
+
+With patches 0006, 0010 and 0011 in place the stack now runs **fully
+automatic** end to end: on a cold boot mctpd discovers the Zephyr endpoint by
+itself (SetupEndpoint), installs the kernel route and neighbour, and publishes
+it on D-Bus for `pldmd`. No manual `mctp route add` or raw-netlink helper is
+needed.
 
 **Zephyr side** (branch chain
 `hfm/mctp-i3c-binding` → `hfm/pldm-type0` → `hfm/mctp-i2c-binding` →
@@ -15,23 +21,27 @@ diffs rooted at the OpenBMC tree top.
 - 0007 PLDM Type 2 platform responder + PDR (DSP0248) — MR1
 - 0008 MCTP control responder (DSP0236) + serial_bridge Type 2 wiring — MR2
 - 0009 set MCTP tag-owner bit on requester TX — reverse-path fix (MR3)
+- 0011 clear MCTP tag-owner bit on control responses — auto-discovery fix (MR4)
 
 **OpenBMC side** (Yocto layers):
 
 - 0004 enable MCTP + PLDM over serial on `evb-ast2600`
-- 0006 let mctpd auto-discover the endpoint (Type 2, rev 2) — MR2 BMC delta
+- 0006 order the serial link before mctpd so auto-discovery installs the route
+- 0010 backport the AF_MCTP netlink-dump fix to the `evb-ast2600` kernel
 
-| # | Patch | Target / Branch (local) |
-|---|---|---|
-| 1 | `0001-subsys-pmci-mctp-add-MCTP-over-I3C-binding-DSP0233-v.patch` | Zephyr `hfm/mctp-i3c-binding` |
-| 2 | `0002-subsys-pmci-add-PLDM-subsystem-and-DSP0240-Type-0-su.patch`  | Zephyr `hfm/pldm-type0` |
-| 3 | `0003-subsys-pmci-mctp-add-MCTP-over-SMBus-I2C-binding-DSP.patch`  | Zephyr `hfm/mctp-i2c-binding` |
-| 4 | `0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch`           | OpenBMC (Yocto layers) |
-| 5 | `0005-subsys-pmci-mctp-add-MCTP-over-serial-binding-DSP025.patch`  | Zephyr `hfm/mctp-i2c-binding` |
-| 6 | `0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch`   | OpenBMC (Yocto layers) |
-| 7 | `0007-subsys-pmci-pldm-add-DSP0248-Type-2-Platform-Monitor.patch`  | Zephyr `hfm/pldm-type2` |
-| 8 | `0008-subsys-pmci-mctp-add-DSP0236-control-responder-wire-.patch`  | Zephyr `hfm/pldm-type2` |
-| 9 | `0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch`   | Zephyr `hfm/pldm-type2` |
+| # | Patch | Target / Branch (local) | Apply |
+|---|---|---|---|
+| 1 | `0001-subsys-pmci-mctp-add-MCTP-over-I3C-binding-DSP0233-v.patch` | Zephyr `hfm/mctp-i3c-binding` | `git am` |
+| 2 | `0002-subsys-pmci-add-PLDM-subsystem-and-DSP0240-Type-0-su.patch`  | Zephyr `hfm/pldm-type0` | `git am` |
+| 3 | `0003-subsys-pmci-mctp-add-MCTP-over-SMBus-I2C-binding-DSP.patch`  | Zephyr `hfm/mctp-i2c-binding` | `git am` |
+| 4 | `0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch`           | OpenBMC (Yocto layers) | `git apply` |
+| 5 | `0005-subsys-pmci-mctp-add-MCTP-over-serial-binding-DSP025.patch`  | Zephyr `hfm/mctp-i2c-binding` | `git am` |
+| 6 | `0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch`   | OpenBMC (Yocto layers) | `git apply` |
+| 7 | `0007-subsys-pmci-pldm-add-DSP0248-Type-2-Platform-Monitor.patch`  | Zephyr `hfm/pldm-type2` | `git am` |
+| 8 | `0008-subsys-pmci-mctp-add-DSP0236-control-responder-wire-.patch`  | Zephyr `hfm/pldm-type2` | `git am` |
+| 9 | `0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch`   | Zephyr `hfm/pldm-type2` | `git apply` |
+| 10 | `0010-openbmc-evb-ast2600-kernel-fix-mctp-netlink-dump-busy-loop.patch` | OpenBMC (Yocto layers) | `git apply` |
+| 11 | `0011-subsys-pmci-mctp-clear-tag-owner-bit-on-control-response.patch`   | Zephyr `hfm/pldm-type2` | `git am` |
 
 Auxiliary (non-numbered) patches, applied per README Part 1/3 rather than
 as part of the MR stack:
@@ -338,9 +348,11 @@ the console. Once both are up, `pldmtool base GetTID` from the BMC targets
 EID 18.
 
 `scripts/two_qemu_smoke.py` automates the full end-to-end check: it boots both
-QEMU instances, SSHes into the BMC, brings up `mctpserial0`, installs the route
-to EID 18, and runs real `pldmtool` (GetTID / GetPLDMTypes / GetPLDMVersion).
-It passes end-to-end through OpenBMC's **kernel** AF_MCTP stack:
+QEMU instances, SSHes into the BMC, brings up `mctpserial0`, and runs real
+`pldmtool` (GetTID / GetPLDMTypes / GetPLDMVersion). With the fixed kernel
+(patch 0010) and the fixed unit ordering (patch 0006), mctpd discovers the
+endpoint and installs the route itself; the smoke test then talks to EID 18
+through OpenBMC's **kernel** AF_MCTP stack:
 
 ```
 pldmtool base GetTID         -> {"Response": 1}
@@ -348,50 +360,62 @@ pldmtool base GetPLDMTypes   -> SUCCESS, PLDM Type base (0)
 pldmtool base GetPLDMVersion -> SUCCESS, 1.1.0
 ```
 
-> **`mctp route add` CLI busy-loop on the prebuilt image.** The codeconstruct
-> `mctp` CLI's `route`/`addr` dump paths spin forever in userspace (100% CPU,
-> `wchan=0`, no kernel WARN); `link set up` / `addr add` are fine. The BMC has
-> only busybox (no python/perl/compiler, no `base64`, no `ip mctp`), so
-> `scripts/mctp_route_add.c` is a static ARM raw-`AF_NETLINK` helper
-> (`RTM_NEWROUTE`, `AF_MCTP`) cross-compiled on the host
-> (`arm-linux-gnueabihf-gcc -static`) and streamed over SSH. Add the route with
-> **no MTU** — a nested `RTA_METRICS`/MTU is rejected by strict netlink
-> validation (extack `"incorrect format"`, EINVAL).
+> **History — `mctp route add` CLI busy-loop.** On the *original* prebuilt
+> image the codeconstruct `mctp` CLI's `route`/`addr` dump paths spun forever
+> in userspace (100% CPU). The root cause was a kernel AF_MCTP netlink-dump bug
+> in 6.6.92, now fixed by patch 0010 (backport of upstream `cfa7fa02078d`).
+> With that fix `mctp route`/`mctp addr` return immediately and mctpd's own
+> discovery works, so the old raw-netlink route helper is no longer needed.
 
 ---
 
-## Patch 0006 — OpenBMC evb-ast2600: mctpd auto-discovery (Type 2, rev 2)
+## Patch 0006 — OpenBMC evb-ast2600: order the serial link before mctpd
 
 Rev-2 BMC-side delta on top of patch 0004, paired with the Zephyr MR2 control
-responder (`CONFIG_MCTP_CONTROL`). Once the Zephyr node answers the baseline
-MCTP control commands, mctpd's `SetupEndpoint` can enumerate it end to end, so
-`mctp-local.service` is simplified:
+responder (`CONFIG_MCTP_CONTROL`) and its tag-owner fix (patch 0011). Once the
+Zephyr node answers the baseline MCTP control commands with TO=0 responses,
+mctpd's `SetupEndpoint` can enumerate it end to end and install the route
+itself — provided the serial link exists **before** mctpd starts.
 
+The stock unit ordered itself `After=mctpd.service`, so mctpd came up before
+`mctpserial0` existed. mctpd snapshots the kernel link map exactly once at
+startup into its route-query netlink handle (`ctx->nl_query`) and never
+refreshes it from the monitor socket, so a link that appears afterwards is
+invisible to `peer_route_update()` — it fails with `BUG: Unknown ifindex` and
+the route to the discovered endpoint is never installed (`pldmtool -m 18` then
+returns `rc=-7`). This patch fixes the ordering:
+
+- Split `mctp-local.service` into two units. `mctp-local.service` creates the
+  serial link, brings `mctpserial0` up and assigns the local EID (8); it is
+  ordered `Before=mctp-local.target`, and mctpd.service is already
+  `After=mctp-local.target`, so the interface exists before mctpd enumerates.
+- `mctp-setup-endpoint.service` (oneshot) runs the `SetupEndpoint` busctl call
+  after mctpd is up, wrapped in a bounded 40 × 3 s retry loop since the
+  endpoint (a separate Zephyr QEMU instance) may boot after the BMC.
 - Drop the manual `mctp route add 18 via mctpserial0` line — mctpd installs the
-  route itself on a successful `SetupEndpoint`, and that CLI route/addr path is
-  the exact AF_MCTP netlink dump that busy-loops on this kernel image.
-- Wrap the `SetupEndpoint` busctl call in a bounded 40 × 3 s retry loop, since
-  the endpoint (a separate Zephyr QEMU instance) may boot after the BMC.
+  route itself on a successful `SetupEndpoint`.
 
 ### Files
 
 | File | Change |
 |---|---|
-| `.../recipes-phosphor/mctp/files/mctp-local.service` | drop manual route; retry SetupEndpoint |
+| `.../recipes-phosphor/mctp/files/mctp-local.service` | order `Before=mctp-local.target`; link/EID only |
+| `.../recipes-phosphor/mctp/files/mctp-setup-endpoint.service` | new — oneshot SetupEndpoint retry loop, after mctpd |
+| `.../recipes-phosphor/mctp/mctp_%.bbappend` | ship + enable the second unit |
 
-### Environment note
+### Verification (cold boot, zero manual steps)
 
-On this image mctpd's own startup netlink dump (`fill_linkmap` →
-`RTM_GETLINK | NLM_F_DUMP`) busy-loops on the 6.6.92 AF_MCTP kernel, so
-fully-automatic discovery cannot complete here. The Zephyr MR1+MR2 responders
-were instead validated over the **real** kernel AF_MCTP transport by installing
-the route with a raw-netlink helper (SET, never dumps) and addressing EID 18
-directly with `pldmtool`: `base GetTID`/`GetPLDMTypes` and `platform
-GetPDR`/`GetSensorReading` (presentReading 31) all answered correctly. See
-`docs/pldm-mctp-i3c-design.md` §10c for the full evidence.
+With the fixed kernel image (patch 0010) and Zephyr firmware (patch 0011), a
+cold boot of the two QEMU instances brings up auto-discovery with no manual
+steps: `mctp-local` / `mctpd` / `mctp-setup-endpoint` all active, SetupEndpoint
+succeeds once, mctpd auto-installs the kernel route `eid min 18 max 18 dev
+mctpserial0` and the neighbour, `endpoints/18` is published on D-Bus, and
+`pldmtool base GetTID`/`GetPLDMTypes` + `platform GetPDR`/`GetSensorReading`
+over `-m 18` all answer `rc=0` (presentReading 31).
 
-The paired Zephyr side is patches 0007 (Type 2 responder) and 0008 (control
-responder) below.
+The paired Zephyr side is patches 0007 (Type 2 responder), 0008 (control
+responder) and 0011 (control-response tag-owner fix) below; the kernel fix is
+patch 0010.
 
 ---
 
@@ -469,11 +493,10 @@ enumerate a statically-addressed endpoint, and wires the Type 2 sensor into the
 | `samples/subsys/pmci/pldm/serial_bridge/src/main.c` | register sensor; chain responder; reverse probe |
 
 With this, `mctpd` runs Get Endpoint ID / Get Message Type Support against the
-node and (on a kernel without the AF_MCTP dump bug) publishes it on D-Bus for
-`pldmd` platform-mc to poll. The BMC-side enablement is patch 0006. On this
-image full auto-discovery is blocked by the kernel bug documented under patch
-0006; the responders were validated directly over the kernel AF_MCTP transport
-(design doc §10c).
+node and publishes it on D-Bus for `pldmd` platform-mc to poll. The BMC-side
+enablement is patch 0006. Note that this responder replies with the tag-owner
+bit set (TO=1), which patch 0011 fixes; without that fix mctpd's discovery
+query never matches the reply and `SetupEndpoint` times out.
 
 ---
 
@@ -510,6 +533,76 @@ shows matching `rx_packets=3 / tx_packets=3` (design doc §10c).
 
 ---
 
+## Patch 0010 — OpenBMC evb-ast2600: fix the AF_MCTP netlink-dump busy-loop (kernel)
+
+Backports the upstream fix for a kernel AF_MCTP netlink-dump busy-loop present
+in the `evb-ast2600` kernel (6.6.92). The bug made `mctpd` (and the `mctp`
+CLI's `route`/`addr` dumps) spin at 100% CPU forever, so automatic endpoint
+discovery could never complete.
+
+Root cause: `for_each_netdev_dump()` was implemented with
+`xa_for_each_start()`, whose cursor is not advanced when the walk ends, so an
+`RTM_GETADDR | NLM_F_DUMP` over AF_MCTP (`mctp_dump_addrinfo`) restarted from
+the same index on every netlink recvmsg and never emitted `NLMSG_DONE`.
+Upstream commit `cfa7fa02078d` (v6.6-stable backport of `f22b4b55edb5`, "net:
+make for_each_netdev_dump() bug-proof", first in v6.6.95) reworks the macro to
+`xa_find(...); ifindex++`, terminating the dump correctly. Our base SRCREV
+`ca938df` (v6.6.92-421) carries the CVE dependency `2d45eeb7d5d7` but not this
+macro fix, so we ship it as a layer patch.
+
+### Files
+
+| File | Change |
+|---|---|
+| `.../recipes-kernel/linux/linux-aspeed/0010-net-make-for_each_netdev_dump-bug-proof.patch` | new — backport `cfa7fa02078d` |
+| `.../recipes-kernel/linux/linux-aspeed_%.bbappend` | `SRC_URI:append:df-mctp` mounts the patch |
+
+The kernel patch carries an `Upstream-Status: Backport [...]` header (required
+or `do_patch` fails the Yocto QA check). After applying, rebuild the kernel:
+
+```sh
+bitbake -c cleansstate linux-aspeed && bitbake obmc-phosphor-image
+```
+
+Verified on the rebuilt image: with the interface addressed, `mctp addr` /
+`mctp route` dumps return `rc=0` immediately, mctpd's CPU delta over 2 s is ~0,
+and the busy-loop is gone (`uname -r` = `6.6.92-ca938df-dirty-...`).
+
+---
+
+## Patch 0011 — clear the MCTP tag-owner bit on control responses (auto-discovery fix, MR4)
+
+Fixes mctpd's automatic endpoint discovery (`SetupEndpoint`) against the Zephyr
+serial_bridge node. The control-protocol responder replied to Get/Set Endpoint
+ID with `MCTP_MESSAGE_TO_SRC` (tag-owner bit TO = 1). An MCTP *response* must
+clear TO: the requester (the BMC bus owner, mctpd) owns the message tag
+(DSP0236 §8.1), so the reply must reuse the requester-supplied tag with TO = 0.
+This is the mirror image of patch 0009 (requests must set TO = 1).
+
+- mctpd enumerates a static endpoint with physical addressing (null EID) over a
+  dedicated query socket. The kernel AF_MCTP stack matches the reply to that
+  socket by `(src, dest, tag)`, and the match key **includes** the TO bit
+  (`net/mctp/route.c` `mctp_lookup_key`:
+  `tag = flags_seq_tag & (MCTP_HDR_TAG_MASK | MCTP_HDR_FLAG_TO)`).
+- A response with TO = 1 fails that match, so the kernel treats the frame as a
+  fresh request and routes it to mctpd's bound daemon socket (`mctp_lookup_bind`)
+  instead of the query socket. mctpd logs `Got control request command code 2`
+  and the query socket never sees the answer, so `SetupEndpoint` times out.
+
+### Files
+
+| File | Change |
+|---|---|
+| `subsys/pmci/mctp/mctp_control.c` | `ctrl_send()`: `MCTP_MESSAGE_TO_SRC` → `MCTP_MESSAGE_TO_DST` |
+
+With this fix (plus patch 0010 and patch 0006), a cold boot completes fully
+automatic discovery: mctpd adopts EID 18, auto-installs the route and neighbour,
+publishes `endpoints/18` on D-Bus, and `pldmtool -m 18` (base + platform) all
+answer `rc=0`. mctpd logs `emit_endpoint_added .../endpoints/18` and `Adding
+route to peer eid 18`.
+
+---
+
 ## How to apply (Zephyr patches)
 
 ```sh
@@ -521,13 +614,15 @@ git am /path/to/Hardware-Fault-Management/patches/0003-subsys-pmci-mctp-add-MCTP
 git am /path/to/Hardware-Fault-Management/patches/0005-subsys-pmci-mctp-add-MCTP-over-serial-binding-DSP025.patch
 git am /path/to/Hardware-Fault-Management/patches/0007-subsys-pmci-pldm-add-DSP0248-Type-2-Platform-Monitor.patch
 git am /path/to/Hardware-Fault-Management/patches/0008-subsys-pmci-mctp-add-DSP0236-control-responder-wire-.patch
-git am /path/to/Hardware-Fault-Management/patches/0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch
+git am /path/to/Hardware-Fault-Management/patches/0011-subsys-pmci-mctp-clear-tag-owner-bit-on-control-response.patch
+# 0009 has no mbox header — apply it as a plain diff:
+git apply /path/to/Hardware-Fault-Management/patches/0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch
 # (west.yml already updated by 0002; run `west update` to fetch libpldm)
 west update libpldm
 ```
 
-Or use the branches already prepared locally under
-`/data00/home/terry.gong/zephyrproject/zephyr` — tip `hfm/pldm-type2`, which
+Or use the branches already prepared locally in your Zephyr workspace
+(`$ZEPHYR_DIR/zephyr`) — tip `hfm/pldm-type2`, which
 descends from `hfm/mctp-i2c-binding` → `hfm/pldm-type0` → `hfm/mctp-i3c-binding`.
 
 ## How to apply (OpenBMC patches)
@@ -536,7 +631,8 @@ descends from `hfm/mctp-i2c-binding` → `hfm/pldm-type0` → `hfm/mctp-i3c-bind
 cd /path/to/openbmc
 git apply /path/to/Hardware-Fault-Management/patches/0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch
 git apply /path/to/Hardware-Fault-Management/patches/0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch
-source oe-init-build-env build && bitbake obmc-phosphor-image
+git apply /path/to/Hardware-Fault-Management/patches/0010-openbmc-evb-ast2600-kernel-fix-mctp-netlink-dump-busy-loop.patch
+source oe-init-build-env build && bitbake -c cleansstate linux-aspeed && bitbake obmc-phosphor-image
 ```
 
 ## Follow-ups (out of scope for this MR set)
@@ -545,5 +641,3 @@ source oe-init-build-env build && bitbake obmc-phosphor-image
   `docs/pldm-mctp-i3c-design.md` §5) to enable two-QEMU interconnect.
 - DTS overlay wiring a peer target to `i3c@4000000` / an I2C bus node.
 - Sample apps `hfm_pldm_discover` / `hfm_pldm_sensors`.
-- A kernel with a working AF_MCTP netlink dump so `mctpd` auto-discovery
-  completes on `evb-ast2600` (see patch 0006 environment note).

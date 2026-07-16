@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: HFM <hfm@ocp>
+Date: Thu, 16 Jul 2026 18:00:00 +0800
+Subject: [PATCH] subsys/pmci/mctp: clear the MCTP tag-owner bit on control
+ responses (auto-discovery fix)
+
+Fix mctpd's automatic endpoint discovery (SetupEndpoint) against the Zephyr
+serial_bridge node. The control-protocol responder replied to Get/Set
+Endpoint ID with MCTP_MESSAGE_TO_SRC, i.e. tag-owner (TO) bit = 1 on the wire.
+An MCTP *response* must clear TO: the requester (the BMC bus owner, mctpd) owns
+the message tag (DSP0236 8.1), so the reply must reuse the requester-supplied
+tag with TO = 0.
+
+Why TO = 1 broke discovery on the real BMC:
+
+  * mctpd enumerates a static endpoint with physical addressing (null EID)
+    over a dedicated query socket (endpoint_query_addr). The Linux kernel
+    AF_MCTP stack matches the reply to that waiting socket by (src, dest, tag),
+    and the match key includes the TO bit (net/mctp/route.c mctp_lookup_key:
+    tag = flags_seq_tag & (MCTP_HDR_TAG_MASK | MCTP_HDR_FLAG_TO)).
+  * A response carrying TO = 1 fails that key match, so the kernel treats the
+    frame as a *fresh request* and routes it to mctpd's bound daemon socket
+    (mctp_lookup_bind) instead of the query socket. mctpd logs "Got control
+    request command code 2" and the query socket never sees the answer, so
+    SetupEndpoint times out and no endpoint is published on D-Bus.
+
+This is the mirror image of the requester-path fix (requests must set TO = 1,
+see patch 0009): responses must clear it.
+
+With this change, on a kernel whose AF_MCTP dump is not broken (patch 0010)
+and with the serial link ordered before mctpd (patch 0006), mctpd's
+SetupEndpoint completes, adopts EID 18, auto-installs the kernel route and
+neighbour, and publishes endpoints/18 so pldmd's platform-mc polls it. No
+manual "mctp route add" is required.
+
+Signed-off-by: HFM <hfm@ocp>
+---
+ subsys/pmci/mctp/mctp_control.c | 13 ++++++++++++-
+ 1 file changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/subsys/pmci/mctp/mctp_control.c b/subsys/pmci/mctp/mctp_control.c
+index 9e478dfa5f4..87d3e65b506 100644
+--- a/subsys/pmci/mctp/mctp_control.c
++++ b/subsys/pmci/mctp/mctp_control.c
+@@ -56,6 +56,17 @@ LOG_MODULE_REGISTER(mctp_control, CONFIG_MCTP_LOG_LEVEL);
+ /*
+  * Fill the control-response header into @buf and transmit @len bytes (message
+  * type + control header + payload) back to @src. The caller fills the payload.
++ *
++ * A control *response* must clear the MCTP tag-owner (TO) bit: the requester
++ * (the BMC bus owner, e.g. mctpd) owns the tag, so we reply with TO=0 reusing
++ * the requester-supplied @msg_tag. mctpd runs Get/Set Endpoint ID with
++ * physical addressing (null EID) on a dedicated query socket and matches the
++ * reply by (src,dest,tag), where tag includes the TO bit (see route.c
++ * mctp_lookup_key). Replying with TO=1 makes the BMC kernel treat the frame as
++ * a fresh request and deliver it to mctpd's bound daemon socket instead of the
++ * waiting query socket, so endpoint discovery (SetupEndpoint) times out. This
++ * is the mirror image of the requester path, which must set TO=1 (see the
++ * reverse PLDM probe in the serial_bridge sample).
+  */
+ static void ctrl_send(struct mctp_control_ctx *ctx, mctp_eid_t src,
+ 		      uint8_t msg_tag, uint8_t iid, uint8_t cmd, uint8_t *buf,
+@@ -68,7 +79,7 @@ static void ctrl_send(struct mctp_control_ctx *ctx, mctp_eid_t src,
+ 			    (iid & MCTP_CTRL_HDR_INSTANCE_ID_MASK);
+ 	buf[OFF_CMD_CODE] = cmd;
+ 
+-	rc = mctp_message_tx(ctx->mctp, src, MCTP_MESSAGE_TO_SRC, msg_tag, buf,
++	rc = mctp_message_tx(ctx->mctp, src, MCTP_MESSAGE_TO_DST, msg_tag, buf,
+ 			     len);
+ 	if (rc != 0) {
+ 		LOG_WRN("control cmd 0x%02x tx failed: %d", cmd, rc);
+--
+2.34.1

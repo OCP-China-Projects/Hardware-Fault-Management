@@ -59,8 +59,8 @@ pip install patool semver tqdm pyelftools --break-system-packages
 This repo does **not** vendor full copies of the three upstream trees.
 Each is pinned to a public release below; every change this project
 makes to them ships as a patch under
-[patches/](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches)
-(see [patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md)
+[patches/](patches)
+(see [patches/README.md](patches/README.md)
 for the full index and apply order). Clone the upstream at the pinned
 ref, apply the patches, and you reproduce the exact tree used here.
 
@@ -145,7 +145,7 @@ about 85 MB).
 Because the local glib lives outside the loader path, direct invocation
 of the freshly built binary aborts with
 `undefined symbol: g_uri_parse_params`. Use the wrapper at
-[scripts/qemu11.sh](file:///home/terry.gong/workspace/Hardware-Fault-Management/scripts/qemu11.sh)
+[scripts/qemu11.sh](scripts/qemu11.sh)
 instead of calling `qemu-system-*` directly:
 
 ```shell
@@ -177,7 +177,7 @@ platform). It is far friendlier than `hifive_unmatched` for emulation:
   need to plug an I3C controller in later (Part 3).
 
 Board metadata:
-[boards/qemu/riscv64/qemu_riscv64.yaml](file:///data00/home/terry.gong/zephyrproject/zephyr/boards/qemu/riscv64/qemu_riscv64.yaml).
+`boards/qemu/riscv64/qemu_riscv64.yaml`.
 
 ### Build Zephyr for `qemu_riscv64` and boot it
 
@@ -247,10 +247,10 @@ sample built for `hifive_unleashed/fu540/u54` (it boots under QEMU's
 EID 18). Two patches are required to boot it under QEMU 11
 because `sifive_u` is a partial FU540/FU740 model:
 
-- [patches/zephyr-fu700-pll-lock-qemu-timeout.patch](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/zephyr-fu700-pll-lock-qemu-timeout.patch)
+- [patches/zephyr-fu700-pll-lock-qemu-timeout.patch](patches/zephyr-fu700-pll-lock-qemu-timeout.patch)
   — bounds `soc_early_init_hook`'s wait for PLL_LOCK (QEMU's
   `sifive_u_prci` never asserts it).
-- [patches/zephyr-qemu-hifive.overlay](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/zephyr-qemu-hifive.overlay)
+- [patches/zephyr-qemu-hifive.overlay](patches/zephyr-qemu-hifive.overlay)
   — redirects `zephyr,sram` to DDR and shrinks `ram0` so heap init
   does not fault above `-m 256`.
 
@@ -274,33 +274,33 @@ peripherals are required.
 ### Where the source comes from
 
 **QEMU side** — DesignWare I3C controller model, in-tree since QEMU
-11.x under [hw/i3c/](file:///data00/home/terry.gong/qemu-11-src/hw/i3c):
+11.x under `hw/i3c/`:
 
 | File                                                                                                                    | Role                                            |
 |-------------------------------------------------------------------------------------------------------------------------|-------------------------------------------------|
-| [hw/i3c/core.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/core.c)                                               | I3C bus core (arbitration, CCC, IBI plumbing)   |
-| [hw/i3c/dw-i3c.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/dw-i3c.c)                                           | Synopsys DesignWare I3C master (`TYPE_DW_I3C`)  |
-| [hw/i3c/aspeed_i3c.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/aspeed_i3c.c)                                   | Aspeed AST2600 wrapper around the DW core       |
-| [hw/i3c/mock-i3c-target.c](file:///data00/home/terry.gong/qemu-11-src/hw/i3c/mock-i3c-target.c)                         | Simple loopback target for testing              |
-| [include/hw/i3c/dw-i3c.h](file:///data00/home/terry.gong/qemu-11-src/include/hw/i3c/dw-i3c.h)                           | `TYPE_DW_I3C = "dw.i3c"` and register map       |
+| `hw/i3c/core.c`                                               | I3C bus core (arbitration, CCC, IBI plumbing)   |
+| `hw/i3c/dw-i3c.c`                                           | Synopsys DesignWare I3C master (`TYPE_DW_I3C`)  |
+| `hw/i3c/aspeed_i3c.c`                                   | Aspeed AST2600 wrapper around the DW core       |
+| `hw/i3c/mock-i3c-target.c`                         | Simple loopback target for testing              |
+| `include/hw/i3c/dw-i3c.h`                           | `TYPE_DW_I3C = "dw.i3c"` and register map       |
 
 **Zephyr side** — DesignWare I3C driver, upstream since v3.6:
 
 | File                                                                                                                              | Role                                          |
 |-----------------------------------------------------------------------------------------------------------------------------------|-----------------------------------------------|
-| [drivers/i3c/i3c_dw.c](file:///data00/home/terry.gong/zephyrproject/zephyr/drivers/i3c/i3c_dw.c)                                  | Main DW I3C driver (matches the QEMU model)   |
-| [dts/bindings/i3c/snps,designware-i3c.yaml](file:///data00/home/terry.gong/zephyrproject/zephyr/dts/bindings/i3c/snps,designware-i3c.yaml) | Devicetree binding                    |
-| [tests/drivers/build_all/i3c/boards/qemu_cortex_m3.overlay](file:///data00/home/terry.gong/zephyrproject/zephyr/tests/drivers/build_all/i3c/boards/qemu_cortex_m3.overlay) | Reference overlay (borrow the node shape)     |
+| `drivers/i3c/i3c_dw.c`                                  | Main DW I3C driver (matches the QEMU model)   |
+| `dts/bindings/i3c/snps,designware-i3c.yaml` | Devicetree binding                    |
+| `tests/drivers/build_all/i3c/boards/qemu_cortex_m3.overlay` | Reference overlay (borrow the node shape)     |
 
 ### QEMU virt: allow-list DW I3C on the platform bus
 
 `virt` refuses to instantiate arbitrary `-device` types on its platform
 bus — each device type has to be added to `allowed_dynamic_sysbus_dev`.
 The two required edits are captured in
-[patches/qemu-riscv-virt-allow-dw-i3c.patch](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/qemu-riscv-virt-allow-dw-i3c.patch)
+[patches/qemu-riscv-virt-allow-dw-i3c.patch](patches/qemu-riscv-virt-allow-dw-i3c.patch)
 (apply from the QEMU source top with `patch -p1` or `git apply -p1`):
 
-1. **[hw/riscv/virt.c](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/virt.c)** — include the header
+1. **`hw/riscv/virt.c`** — include the header
    and register the type in the machine class init:
 
    ```c
@@ -309,7 +309,7 @@ The two required edits are captured in
    machine_class_allow_dynamic_sysbus_dev(mc, TYPE_DW_I3C);
    ```
 
-2. **[hw/riscv/Kconfig](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/Kconfig)** — pull the I3C
+2. **`hw/riscv/Kconfig`** — pull the I3C
    modules into the `RISCV_VIRT` config so they get compiled and
    linked into `qemu-system-riscv64`:
 
@@ -345,7 +345,7 @@ Add a devicetree overlay at
 `boards/qemu_riscv64.overlay` (or pass it via `-DDTC_OVERLAY_FILE=`)
 using the platform-bus MMIO window (`0x04000000`, size `0x02000000` —
 see `virt_memmap[VIRT_PLATFORM_BUS]` in
-[virt.c](file:///data00/home/terry.gong/qemu-11-src/hw/riscv/virt.c#L92)):
+`virt.c`):
 
 ```dts
 / {
@@ -396,11 +396,11 @@ Parts 1–3 stand up the emulation substrate. Part 4 is the payload: a
 DMTF PMCI stack (MCTP transport + PLDM application) that lets an OpenBMC
 management controller discover and poll a Zephyr endpoint the way a real
 BMC polls a satellite MCU. All of it is delivered as a numbered set of
-patches under [patches/](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches);
+patches under [patches/](patches);
 the full per-patch index (files touched, Kconfig, apply order) lives in
-[patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md),
+[patches/README.md](patches/README.md),
 and the protocol design in
-[docs/pldm-mctp-i3c-design.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/docs/pldm-mctp-i3c-design.md).
+[docs/pldm-mctp-i3c-design.md](docs/pldm-mctp-i3c-design.md).
 
 ### What the stack contains
 
@@ -453,28 +453,27 @@ MCTP_SOCK=/tmp/hfm-mctp.sock ./launch_openbmc.sh    # terminal 1 (server)
 MCTP_SOCK=/tmp/hfm-mctp.sock ./launch_hfm.sh        # terminal 2 (client)
 ```
 
-Once both are up, from the BMC console bring the link up and talk PLDM
-to EID 18:
+Once both are up, `mctpd` on the BMC discovers the Zephyr endpoint by
+itself (SetupEndpoint at boot) and installs the route to EID 18, so from
+the BMC console you can talk PLDM to EID 18 directly:
 
 ```shell
-mctp link set mctpserial0 up
-mctp addr add 8 dev mctpserial0
-# route to EID 18 — see the busy-loop note below
+mctp route          # eid min 18 max 18 dev mctpserial0 (auto-installed)
 pldmtool base GetTID -m 18
 pldmtool base GetPLDMTypes -m 18
 pldmtool platform GetPDR -m 18 -d 0
-pldmtool platform GetSensorReading -m 18 -i 1
+pldmtool platform GetSensorReading -m 18 -i 1 --rearm 0
 ```
 
 `scripts/two_qemu_smoke.py` automates this end to end (boots both
-instances, brings up `mctpserial0`, installs the route, runs
-`pldmtool`).
+instances, waits for auto-discovery, runs `pldmtool`).
 
 ### Build the Zephyr endpoint from source
 
 Apply the Zephyr patches (see
-[patches/README.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/patches/README.md#L468)
-for the full `git am` order) and build the bridge sample for the
+[patches/README.md](patches/README.md)
+for the full apply order — most use `git am`, patch 0009 uses `git
+apply`) and build the bridge sample for the
 `sifive_u`-compatible board:
 
 ```shell
@@ -487,22 +486,35 @@ scripts/qemu11.sh riscv64 -machine sifive_u -smp 2 -m 256 -nographic \
     -serial mon:stdio -serial unix:/tmp/hfm-mctp.sock
 ```
 
-### Known limitation — mctpd auto-discovery on this kernel
+### mctpd auto-discovery (fully automatic)
 
-The BMC's kernel (`6.6.92`) has an **AF_MCTP netlink-dump busy-loop**:
-`mctpd` calls `fill_linkmap()` (`RTM_GETLINK | NLM_F_DUMP`) at startup,
-the dump spins in the kernel, and the event loop never advances — so
-`mctpd`'s automatic `SetupEndpoint` cannot complete and its `mctp
-route`/`addr` CLI dump paths also hang. The MCTP/PLDM responders were
-therefore validated by installing the route to EID 18 with a raw-netlink
-helper (`scripts/mctp_route_add.c`, `RTM_NEWROUTE` — sets, never dumps)
-and addressing EID 18 directly with `pldmtool`. `GetTID`,
-`GetPLDMTypes`, `GetPDR` (Terminus Locator PDR, EID 18) and
-`GetSensorReading` (presentReading 31) all answer correctly over the
-**real** kernel AF_MCTP transport. Full evidence is in
-[docs/pldm-mctp-i3c-design.md](file:///home/terry.gong/workspace/Hardware-Fault-Management/docs/pldm-mctp-i3c-design.md)
-§10c and the patch 0006 environment note. A kernel with a working
-AF_MCTP dump would let `mctpd` self-discover the endpoint.
+On a cold boot `mctpd` discovers the Zephyr endpoint by itself and
+installs the kernel route — no manual `mctp route add` and no raw-netlink
+helper. Getting there took three fixes, all shipped in this repo:
+
+- **Kernel (patch 0010).** The `evb-ast2600` kernel `6.6.92` had an
+  AF_MCTP netlink-dump busy-loop: `for_each_netdev_dump()` used
+  `xa_for_each_start()`, whose cursor is not advanced at the end of the
+  walk, so an `RTM_GETADDR | NLM_F_DUMP` (`mctp_dump_addrinfo`) never
+  emitted `NLMSG_DONE` and `mctpd` spun at 100% CPU. Backporting upstream
+  `cfa7fa02078d` ("net: make `for_each_netdev_dump()` bug-proof") fixes it.
+- **Zephyr control responder (patch 0011).** The endpoint replied to
+  Get/Set Endpoint ID with the MCTP tag-owner (TO) bit set. A response
+  must clear TO; with TO=1 the BMC kernel treated the reply as a fresh
+  request and mctpd's discovery query timed out.
+- **BMC unit ordering (patch 0006).** `mctpd` snapshots the kernel link
+  map once at startup, so the serial link must exist *before* it starts.
+  `mctp-local.service` now brings the link up ordered before mctpd, and a
+  separate `mctp-setup-endpoint.service` runs `SetupEndpoint` after it.
+
+Verified on a cold boot of the two QEMU instances (zero manual steps):
+`SetupEndpoint` succeeds, `mctp route` shows `eid min 18 max 18 dev
+mctpserial0`, `endpoints/18` is published on D-Bus, and `pldmtool -m 18`
+`base GetTID`/`GetPLDMTypes` + `platform GetPDR`/`GetSensorReading`
+(presentReading 31) all answer over the **real** kernel AF_MCTP transport.
+Full evidence is in
+[docs/pldm-mctp-i3c-design.md](docs/pldm-mctp-i3c-design.md)
+§10c and the patch 0006/0010/0011 notes.
 
 ---
 
@@ -534,10 +546,11 @@ source archives on the first run.
 
 > **Important — apply the HFM patches.** The stock `obmc-phosphor-image`
 > for `evb-ast2600` ships **no** mctp/pldm binaries. You must apply
-> patches **0004** (enable MCTP + PLDM over serial) and **0006** (mctpd
-> auto-discovery delta) from `patches/` *before*
-> `bitbake`, or the resulting image cannot run Part 4 (no `mctpd`,
-> `pldmd`, `mctp`, or `pldmtool`). The prebuilt shipped in
+> patches **0004** (enable MCTP + PLDM over serial), **0006** (order the
+> serial link before mctpd) and **0010** (kernel AF_MCTP dump fix) from
+> `patches/` *before* `bitbake`, or the resulting image cannot run Part 4
+> (no `mctpd`, `pldmd`, `mctp`, or `pldmtool`) or cannot auto-discover the
+> endpoint. The prebuilt shipped in
 > `prebuilts/obmc-phosphor-image-evb-ast2600.mtd.gz` is already patched
 > — rebuild from scratch only if you need to change the stack.
 
@@ -552,9 +565,10 @@ sudo sysctl -w kernel.unprivileged_userns_clone=1
 cd openbmc
 git checkout 2.18.0 -b 2.18.0
 
-# Apply the HFM Yocto-layer patches (enable mctp/pldm + auto-discovery).
-git am ../patches/0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch
-git am ../patches/0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch
+# Apply the HFM Yocto-layer patches (plain diffs — use git apply, not git am).
+git apply ../patches/0004-openbmc-evb-ast2600-enable-mctp-pldm-serial.patch
+git apply ../patches/0006-openbmc-evb-ast2600-mctp-local-auto-discovery-retry.patch
+git apply ../patches/0010-openbmc-evb-ast2600-kernel-fix-mctp-netlink-dump-busy-loop.patch
 
 # bitbake 2.12 requires Python 3.9+. Ubuntu 20.04 ships 3.8 as
 # `python3`, so add a shim that points `python3` at 3.9 for this shell:
@@ -565,6 +579,10 @@ export PATH=/tmp/bb-pyshim:$PATH
 
 export TEMPLATECONF="meta-evb/meta-evb-aspeed/meta-evb-ast2600/conf/templates/default"
 source ./poky/oe-init-build-env build
+# Patch 0010 touches the kernel; force a clean kernel rebuild so the patch is
+# picked up (only needed if you rebuild an existing tree — harmless on a fresh
+# checkout).
+bitbake -c cleansstate linux-aspeed
 bitbake obmc-phosphor-image
 ```
 

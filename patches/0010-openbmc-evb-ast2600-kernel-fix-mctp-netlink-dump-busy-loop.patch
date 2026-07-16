@@ -1,0 +1,129 @@
+OpenBMC evb-ast2600: fix AF_MCTP netlink-dump busy-loop in the BMC kernel
+
+Backport the upstream fix f22b4b55edb5 ("net: make for_each_netdev_dump()
+a little more bug-proof", 6.6-stable commit cfa7fa02078d) onto the
+linux-aspeed base used by this image (v6.6.92-421-gca938dfbe2d1), so that
+mctpd's AF_MCTP netlink dumps terminate and MCTP auto-discovery works.
+
+Root cause
+  The linux-aspeed base already carries 2d45eeb7d5d7 ("mctp: no longer rely
+  on net->dev_index_head[]") -- pulled in as a dependency of the
+  CVE-2025-38006 fix acab78ae12c7 -- which switches mctp_dump_addrinfo() to
+  the for_each_netdev_dump() iterator. That iterator was defined with
+  xa_for_each_start(), which does NOT advance the cursor past the last
+  element when the walk finishes. For a netlink dump this means the dump
+  callback is re-invoked forever: an AF_MCTP RTM_GETADDR dump of an
+  interface that already has an address keeps re-emitting the same
+  RTM_NEWADDR and never sends NLMSG_DONE. mctpd's dumps then busy-loop and
+  MCTP auto-discovery (SetupEndpoint, `mctp addr`/`mctp route` CLI) hangs.
+  The base sits after 2d45eeb7d5d7 but before the macro fix cfa7fa02078d
+  (first shipped in v6.6.95), so it hits the bug.
+
+Fix
+  for_each_netdev_dump() now uses xa_find(..., ifindex++), which advances
+  the cursor and lets the dump terminate correctly.
+
+Changes
+  * meta-evb-.../recipes-kernel/linux/linux-aspeed/0010-net-make-for_each_netdev_dump-bug-proof.patch
+      new -- the backported kernel fix (include/linux/netdevice.h), applied
+      to linux-aspeed via kernel-yocto as a git commit.
+  * meta-evb-.../recipes-kernel/linux/linux-aspeed_%.bbappend
+      attach the fix to the df-mctp SRC_URI (same override as the 0001
+      UART1 fragment added by patch 0004).
+
+Verified: bitbake linux-aspeed + obmc-phosphor-image succeed; the rebuilt
+image boots on QEMU with `uname -r` = 6.6.92-ca938df-dirty-3012748-...; on
+an mctpserial0 interface that already has EID 8 assigned, `mctp addr` and
+`mctp route` dumps return rc=0 immediately (were: never returning) and
+mctpd no longer busy-loops (2s CPU delta = 0, loadavg 3.00 -> ~1.0).
+
+Apply on top of patch 0004 (which creates the linux-aspeed_%.bbappend this
+patch extends):
+
+    cd openbmc
+    git apply /path/to/patches/0010-openbmc-evb-ast2600-kernel-fix-mctp-netlink-dump-busy-loop.patch
+
+---
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0010-net-make-for_each_netdev_dump-bug-proof.patch b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0010-net-make-for_each_netdev_dump-bug-proof.patch
+new file mode 100644
+index 0000000..1af6559
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed/0010-net-make-for_each_netdev_dump-bug-proof.patch
+@@ -0,0 +1,60 @@
++From 21cef2383b4c861a0a8ac0c452ba290980892ccb Mon Sep 17 00:00:00 2001
++From: HFM <hfm@example.com>
++Date: Thu, 16 Jul 2026 13:40:49 +0800
++Subject: [PATCH] net: make for_each_netdev_dump() a little more bug-proof
++
++commit f22b4b55edb507a2b30981e133b66b642be4d13f upstream
++(6.6-stable backport cfa7fa02078db9849d8e8c642fec78fbb8c99903).
++
++I find the behavior of xa_for_each_start() slightly counter-intuitive.
++It doesn't end the iteration by making the index point after the last
++element. IOW calling xa_for_each_start() again after it "finished"
++will run the body of the loop for the last valid element, instead
++of doing nothing.
++
++This works fine for netlink dumps if they terminate correctly
++(i.e. coalesce or carefully handle NLM_DONE), but as we keep getting
++reminded legacy dumps are unlikely to go away.
++
++Fixing this generically at the xa_for_each_start() level seems hard -
++there is no index reserved for "end of iteration".
++ifindexes are 31b wide, tho, and iterator is ulong so for
++for_each_netdev_dump() it is safe to go to the next element.
++
++Without this fix, our linux-aspeed base (v6.6.92-421-gca938dfbe2d1)
++carries 2d45eeb7d5d7 ("mctp: no longer rely on net->dev_index_head[]")
++-- pulled in as a dependency of the CVE-2025-38006 fix acab78ae12c7
++("net: mctp: Don't access ifa_index when missing") -- which switches
++mctp_dump_addrinfo() to for_each_netdev_dump(). Because the base sits
++after 2d45eeb7d5d7 but before the stable backport cfa7fa02078d
++(first shipped in v6.6.95), an AF_MCTP RTM_GETADDR dump of an interface
++that already has an address never terminates: netlink_dump() keeps
++re-invoking the callback, which re-emits the same RTM_NEWADDR forever
++and never sends NLMSG_DONE. mctpd's netlink dumps then busy-loop,
++breaking MCTP auto-discovery. This backport restores correct dump
++termination.
++
++Upstream-Status: Backport [https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/commit/?id=cfa7fa02078db9849d8e8c642fec78fbb8c99903]
++
++Signed-off-by: Jakub Kicinski <kuba@kernel.org>
++Reviewed-by: Przemek Kitszel <przemyslaw.kitszel@intel.com>
++Signed-off-by: David S. Miller <davem@davemloft.net>
++Signed-off-by: HFM <hfm@example.com>
++---
++ include/linux/netdevice.h | 3 ++-
++ 1 file changed, 2 insertions(+), 1 deletion(-)
++
++diff --git a/include/linux/netdevice.h b/include/linux/netdevice.h
++index 0b0a172337db..030d9de2ba2d 100644
++--- a/include/linux/netdevice.h
+++++ b/include/linux/netdevice.h
++@@ -3036,7 +3036,8 @@ extern rwlock_t				dev_base_lock;		/* Device list lock */
++ #define net_device_entry(lh)	list_entry(lh, struct net_device, dev_list)
++ 
++ #define for_each_netdev_dump(net, d, ifindex)				\
++-	xa_for_each_start(&(net)->dev_by_index, (ifindex), (d), (ifindex))
+++	for (; (d = xa_find(&(net)->dev_by_index, &ifindex,		\
+++			    ULONG_MAX, XA_PRESENT)); ifindex++)
++ 
++ static inline struct net_device *next_net_device(struct net_device *dev)
++ {
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend
+index d599b71..b46e5be 100644
+--- a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-kernel/linux/linux-aspeed_%.bbappend
+@@ -5,3 +5,12 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/${PN}:"
+ # model routes the second -serial backend to UART1; the stock EVB devicetree
+ # leaves UART1 disabled, so add a fragment that turns it on.
+ SRC_URI:append:df-mctp = " file://0001-aspeed-ast2600-evb-enable-uart1-for-mctp-serial.patch"
++
++# Backport cfa7fa02078d ("net: make for_each_netdev_dump() a little more
++# bug-proof", upstream f22b4b55edb5) onto the v6.6.92-421 linux-aspeed base.
++# The base already carries 2d45eeb7d5d7 (switches mctp_dump_addrinfo() to
++# for_each_netdev_dump()) but predates the stable backport of the macro fix
++# (first in v6.6.95). Without it, an AF_MCTP RTM_GETADDR dump of an interface
++# that already has an address never terminates, so mctpd's netlink dumps
++# busy-loop and MCTP auto-discovery hangs. This restores dump termination.
++SRC_URI:append:df-mctp = " file://0010-net-make-for_each_netdev_dump-bug-proof.patch"

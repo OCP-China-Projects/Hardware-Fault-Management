@@ -2,19 +2,23 @@
 # Terminal 3 — drive PLDM on the OpenBMC side over SSH (clean output).
 #
 # Terminals 1 & 2 (launch_openbmc.sh / launch_hfm.sh) show the two QEMU boots.
-# This script SSHes into the already-running BMC (hostfwd 3222->22), streams
-# the two ARM helpers, brings up the MCTP serial link, installs the EID-18
-# route with the raw-netlink helper (the stock `mctp route add` CLI busy-loops
-# on this image), runs pldmtool over EID 18 (FORWARD path), then starts the
-# base responder so the Zephyr node's REVERSE probe can be answered.
+# This script SSHes into the already-running BMC (hostfwd 3222->22) and simply
+# *observes* the fully-automatic discovery that has already happened, then runs
+# forward pldmtool over EID 18.
+#
+# With the three fixes now baked into the image (kernel patch 0010 +
+# Zephyr control-responder patch 0011 + BMC systemd ordering patch 0006),
+# mctpd discovers the Zephyr endpoint on its own at boot: it runs
+# SetupEndpoint, installs the kernel route + neighbour for EID 18, and
+# publishes it on D-Bus for pldmd. There is NO manual `mctp route add`,
+# no raw-netlink helper, and no pldmd surgery — the reverse probe is also
+# answered automatically by the stock pldmd.
 #
 # Run it AFTER both QEMUs are up and the BMC shows its login banner.
 set -u
 
 SSH_PORT=3222
 PASS=0penBmc
-HELPER_ROUTE=/tmp/mctp_route_add
-HELPER_RESP=/tmp/pldm_base_responder
 
 SSH_OPTS=(-p "$SSH_PORT"
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
@@ -34,46 +38,30 @@ for i in $(seq 1 60); do
   sleep 3
 done
 
-say "streaming route helper -> BMC:/tmp/mctp_route_add"
-sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" root@127.0.0.1 \
-  'cat > /tmp/mctp_route_add && chmod +x /tmp/mctp_route_add && echo XFER_OK' < "$HELPER_ROUTE"
-say "streaming base responder -> BMC:/tmp/pldm_base_responder"
-sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" root@127.0.0.1 \
-  'cat > /tmp/pldm_base_responder && chmod +x /tmp/pldm_base_responder && echo XFER_OK' < "$HELPER_RESP"
-
-say "bringing up MCTP link + forward pldmtool over EID 18 ..."
+say "observing auto-discovery + forward pldmtool over EID 18 ..."
 sshpass -p "$PASS" ssh "${SSH_OPTS[@]}" root@127.0.0.1 'bash -s' <<'BMC_EOF'
 set +e
-echo '### teardown stock unit'
-systemctl kill --signal=SIGKILL mctp-local.service 2>/dev/null
-systemctl reset-failed mctp-local.service 2>/dev/null
-systemctl kill --signal=SIGKILL mctp-ldisc.service 2>/dev/null
-systemctl reset-failed mctp-ldisc.service 2>/dev/null
-pkill -9 -f 'mctp link serial' 2>/dev/null
-sleep 1
-echo '### start ldisc + link up + addr'
-stty -F /dev/ttyS0 115200 litout -crtscts -ixon -echo raw
-systemd-run --unit=mctp-ldisc --service-type=simple mctp link serial /dev/ttyS0
-sleep 3
-echo -n 'ldisc active? '; systemctl is-active mctp-ldisc.service
-mctp link set mctpserial0 up ; echo "link-up rc=$?"
-mctp addr add 8 dev mctpserial0 ; echo "addr rc=$?"
-IFX=$(cat /sys/class/net/mctpserial0/ifindex 2>/dev/null); echo "ifindex=$IFX"
-echo '### install route via raw-netlink helper (CLI route add busy-loops here)'
-/tmp/mctp_route_add 18 "$IFX" ; echo "helper-route rc=$?"
+# mctp-setup-endpoint.service retries SetupEndpoint 40x3s at boot; give it a
+# moment to land the route in case terminal 2 (Zephyr) only just connected.
+echo '### waiting for mctpd to auto-discover EID 18 (mctp-setup-endpoint.service) ...'
+for i in $(seq 1 40); do
+  mctp route show 2>/dev/null | grep -q 'eid min 18' && break
+  sleep 3
+done
+echo '### mctpd auto-discovered route (no manual route add):'
+mctp route show
+echo '### MCTP neighbours:'
+mctp neigh show 2>/dev/null
+echo '### D-Bus endpoints published by mctpd:'
+busctl tree au.com.codeconstruct.MCTP1 2>/dev/null | grep -o 'endpoints/[0-9]*' | sort -u
+echo '### mctp-setup-endpoint.service status:'
+systemctl is-active mctp-setup-endpoint.service
 echo '========== FORWARD: BMC (EID 8) -> Zephyr (EID 18) =========='
 pldmtool base GetTID -m 18 ; echo "GetTID rc=$?"
 pldmtool base GetPLDMTypes -m 18 ; echo "GetPLDMTypes rc=$?"
 pldmtool base GetPLDMVersion -m 18 -t 0 ; echo "GetPLDMVersion rc=$?"
 pldmtool platform GetPDR -m 18 -d 0 ; echo "GetPDR rc=$?"
 pldmtool platform GetSensorReading -m 18 -i 1 --rearm 0 ; echo "GetSensorReading rc=$?"
-echo '========== REVERSE prep: stop pldmd, start base responder on EID 8 =========='
-for u in pldmd pldm xyz.openbmc_project.pldmd; do systemctl stop "$u" 2>/dev/null && echo "stopped $u"; done
-pkill -9 -x pldmd 2>/dev/null && echo "pkilled pldmd"
-sleep 1
-setsid /tmp/pldm_base_responder 8 < /dev/null > /tmp/responder.log 2>&1 &
-sleep 2
-echo -n 'responder alive? '; pgrep -f pldm_base_responder >/dev/null && echo yes || echo no
-echo '### DONE. Watch the Zephyr console (terminal 2) for the reverse probe.'
+echo '### DONE. Reverse probe already completed on the Zephyr console (terminal 2).'
 BMC_EOF
-say "done. reverse probe is answered by the responder now running on the BMC."
+say "done. discovery + forward path are fully automatic; reverse probe is answered by the stock pldmd."

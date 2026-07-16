@@ -1,51 +1,138 @@
-OpenBMC evb-ast2600: let mctpd auto-discover the endpoint (drop manual route, retry SetupEndpoint)
+OpenBMC evb-ast2600: order the MCTP serial link before mctpd so auto-discovery installs the route
 
 Rev-2 (PLDM Type 2) BMC-side delta on top of patch 0004. With the Zephyr node
-now answering baseline MCTP control commands (MR2 control responder), mctpd's
-SetupEndpoint enumerates the endpoint itself: it runs Get Endpoint ID, adopts
-EID 18, adds the kernel route and neighbour, queries Get Message Type Support,
-and publishes the endpoint on D-Bus so pldmd's platform-mc discovers and polls
-it. Two changes to mctp-local.service:
+now answering baseline MCTP control commands with the tag-owner bit cleared on
+its responses (Zephyr control-responder fix) and the kernel AF_MCTP dump
+busy-loop fixed on this image (patch 0010), mctpd's SetupEndpoint enumerates
+the endpoint itself: it runs Get Endpoint ID, adopts EID 18, adds the kernel
+route and neighbour, queries Get Message Type Support, and publishes the
+endpoint on D-Bus so pldmd's platform-mc discovers and polls it. No manual
+"mctp route add" is needed.
 
-  * Remove the manual "mctp route add 18 via mctpserial0" line. mctpd installs
-    the route on successful SetupEndpoint, so the line is redundant; it is also
-    the exact AF_MCTP netlink route/addr dump path that busy-loops on this
-    kernel image (see docs/pldm-mctp-i3c-design.md sec 10b/10c).
-  * Wrap the SetupEndpoint busctl call in a bounded retry loop (40 x 3 s). The
-    endpoint is a separate Zephyr QEMU instance that may boot after the BMC, so
-    the BusOwner call must be retried until the node answers.
+The remaining blocker was a startup-ordering race. The stock unit ordered
+itself After=mctpd.service, so mctpd started before the serial link existed.
+mctpd snapshots the kernel link map exactly once at startup into its
+route-query netlink handle (ctx->nl_query) and never refreshes it from the
+monitor socket; a link that appears after mctpd is therefore invisible to
+peer_route_update(), which fails with "BUG: Unknown ifindex" and the route to
+the discovered endpoint can never be installed (pldmtool -m 18 then returns
+rc=-7). Fix: bring the link up before mctpd and run SetupEndpoint after it.
 
-Note (environment): on this image mctpd's own startup netlink dump
-(fill_linkmap -> RTM_GETLINK|NLM_F_DUMP) busy-loops on the 6.6.92 AF_MCTP
-kernel, so fully-automatic discovery cannot complete here; the MR1+MR2 Zephyr
-responders were validated over the real kernel AF_MCTP transport by installing
-the route with a raw-netlink helper and addressing EID 18 directly with
-pldmtool (base GetTID/GetPLDMTypes + platform GetPDR/GetSensorReading all
-answered correctly). See docs sec 10c for the full evidence.
+Split mctp-local.service into two units:
+
+  * mctp-local.service - creates the serial link, brings mctpserial0 up and
+    assigns the local EID (8). Ordered Before=mctp-local.target; mctpd.service
+    is already After=mctp-local.target, so the interface exists (up, with a
+    local EID) before mctpd enumerates. The "mctp link serial" process is the
+    line-discipline holder, so it stays the long-running ExecStart.
+  * mctp-setup-endpoint.service - a oneshot that runs the SetupEndpoint busctl
+    call after mctpd is up (needs its D-Bus BusOwner interface) and after the
+    link exists. The endpoint is a separate Zephyr QEMU instance that may boot
+    after the BMC, so the call is wrapped in a bounded retry loop (40 x 3 s).
+
+Verified on a cold boot with the fixed kernel image and Zephyr firmware (two
+QEMU instances, zero manual steps): mctp-local/mctpd/mctp-setup-endpoint all
+active, SetupEndpoint succeeds once, mctpd auto-installs the kernel route
+"eid min 18 max 18 dev mctpserial0" and neighbour, endpoints/18 is published
+on D-Bus, and pldmtool base GetTID/GetPLDMTypes + platform GetPDR/
+GetSensorReading over -m 18 all answer rc=0.
 
 ---
 
-### meta-evb/.../recipes-phosphor/mctp/files/mctp-local.service (modified)
 diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
-index 533df4c..bbac59e 100644
+index 533df4c..90ef973 100644
 --- a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
 +++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-local.service
-@@ -11,8 +11,13 @@ ExecStart=mctp link serial /dev/ttyS0
+@@ -1,18 +1,23 @@
+ [Unit]
+ Description=MCTP configuration for serial ttyS0 (AST2600 UART1)
+-After=mctpd.service
+-Before=pldmd.service
+-BindsTo=mctpd.service
++# Bring the MCTP-over-serial link up BEFORE mctpd starts. mctpd snapshots the
++# kernel link map once at startup into its route-query netlink handle and does
++# not refresh it from the monitor socket, so a link that appears after mctpd is
++# invisible to peer_route_update() ("BUG: Unknown ifindex") and the route to a
++# discovered endpoint can never be installed. mctpd.service orders itself
++# After=mctp-local.target, so ordering this unit Before that target guarantees
++# the interface exists (and is up, with a local EID) when mctpd enumerates.
++Before=mctp-local.target
+ 
+ [Service]
++# mctp link serial is the line-discipline holder: mctpserial0 exists only while
++# this process lives, so keep it as the long-running ExecStart (Type=simple).
+ Type=simple
+ ExecStartPre=stty -F /dev/ttyS0 115200 litout -crtscts -ixon -echo raw
+ ExecStart=mctp link serial /dev/ttyS0
  ExecStartPost=sleep 3
  ExecStartPost=mctp link set mctpserial0 up
  ExecStartPost=mctp addr add 8 dev mctpserial0
 -ExecStartPost=mctp route add 18 via mctpserial0
 -ExecStartPost=busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0
-+# SetupEndpoint enumerates the remote endpoint (Get Endpoint ID over physical
-+# addressing): mctpd then assigns/accepts its EID, adds the kernel route and
-+# neighbour itself, queries Get Message Type Support, and publishes it on D-Bus
-+# so pldmd's platform-mc discovers it. No manual "mctp route add" is needed
-+# (and the CLI route/addr dump paths busy-loop on this image). The endpoint
-+# (a Zephyr QEMU instance) may boot after the BMC, so retry until it answers.
-+ExecStartPost=/bin/sh -c 'n=0; while [ $n -lt 40 ]; do busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0 && exit 0; n=$((n+1)); sleep 3; done; exit 1'
  
  [Install]
- WantedBy=mctpd.service
+-WantedBy=mctpd.service
++WantedBy=mctp-local.target
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-setup-endpoint.service b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-setup-endpoint.service
+new file mode 100644
+index 0000000..c3771aa
+--- /dev/null
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/files/mctp-setup-endpoint.service
+@@ -0,0 +1,22 @@
++[Unit]
++Description=MCTP endpoint auto-discovery (SetupEndpoint on mctpserial0)
++# Runs after mctpd is up (needs its D-Bus BusOwner interface) and after the
++# serial link exists (mctp-local.service, ordered before mctp-local.target).
++# SetupEndpoint enumerates the remote endpoint (Get Endpoint ID over physical
++# addressing): mctpd assigns/accepts its EID, adds the kernel route and
++# neighbour itself, queries Get Message Type Support, and publishes it on D-Bus
++# so pldmd's platform-mc discovers it. No manual "mctp route add" is needed.
++After=mctpd.service mctp-local.service
++Requires=mctpd.service mctp-local.service
++Before=pldmd.service
++BindsTo=mctpd.service
++
++[Service]
++Type=oneshot
++RemainAfterExit=yes
++# The endpoint (a Zephyr QEMU instance) may boot after the BMC, so retry the
++# BusOwner call until the node answers.
++ExecStart=/bin/sh -c 'n=0; while [ $n -lt 40 ]; do busctl call au.com.codeconstruct.MCTP1 /au/com/codeconstruct/mctp1/interfaces/mctpserial0 au.com.codeconstruct.MCTP.BusOwner1 SetupEndpoint ay 0 && exit 0; n=$((n+1)); sleep 3; done; exit 1'
++
++[Install]
++WantedBy=mctp.target
+diff --git a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend
+index 14948b1..7462ea8 100644
+--- a/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend
++++ b/meta-evb/meta-evb-aspeed/meta-evb-ast2600/recipes-phosphor/mctp/mctp_%.bbappend
+@@ -4,15 +4,26 @@ FILESEXTRAPATHS:prepend := "${THISDIR}/files:"
+ # can speak PLDM to an external endpoint reachable over a UART. The second
+ # QEMU -serial backend is wired to AST2600 UART1, which Linux exposes as
+ # /dev/ttyS0 (serial0 alias). Modeled on meta-evb-fvp-base.
++#
++# Split into two units so ordering is correct for mctpd's auto-discovery:
++#   mctp-local.service        - creates the serial link + local EID, ordered
++#                               Before=mctp-local.target (i.e. before mctpd),
++#                               because mctpd snapshots the link map once at
++#                               startup and never refreshes it.
++#   mctp-setup-endpoint.service - runs SetupEndpoint after mctpd is up so mctpd
++#                               enumerates the peer, installs the kernel route
++#                               and neighbour, and publishes it on D-Bus.
+ SRC_URI:append = " \
+   file://mctp-local.service \
++  file://mctp-setup-endpoint.service \
+   file://mctpd.conf \
+ "
+ 
+-SYSTEMD_SERVICE:${PN} += "mctp-local.service"
++SYSTEMD_SERVICE:${PN} += "mctp-local.service mctp-setup-endpoint.service"
+ 
+ do_install:append() {
+     install -m 0644 ${UNPACKDIR}/mctp-local.service ${D}${systemd_system_unitdir}/
++    install -m 0644 ${UNPACKDIR}/mctp-setup-endpoint.service ${D}${systemd_system_unitdir}/
+     install -d ${D}/etc/
+     install -m 0644 ${UNPACKDIR}/mctpd.conf ${D}/etc/mctpd.conf
+ }
 
 --
 2.34.1
