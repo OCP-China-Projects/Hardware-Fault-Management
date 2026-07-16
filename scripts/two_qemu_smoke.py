@@ -15,12 +15,17 @@ import subprocess
 import time
 
 HOME = os.path.expanduser("~")
-PREBUILTS = "/home/terry.gong/workspace/Hardware-Fault-Management/prebuilts"
-QEMU_ARM = f"{HOME}/qemu-build/bin/qemu-system-arm"
-QEMU_RV = f"{HOME}/qemu-build/bin/qemu-system-riscv64"
+# Repo root is the parent of this script's directory; prebuilts live under it.
+# Every path is overridable via an environment variable so the harness runs
+# unchanged on any machine (no hardcoded /home/<user> paths).
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PREBUILTS = os.environ.get("HFM_PREBUILTS", os.path.join(REPO_ROOT, "prebuilts"))
+QEMU_ARM = os.environ.get("QEMU_ARM", f"{HOME}/qemu-build/bin/qemu-system-arm")
+QEMU_RV = os.environ.get("QEMU_RV", f"{HOME}/qemu-build/bin/qemu-system-riscv64")
 SOCK = "/tmp/hfm-mctp.sock"
-OBMC_IMG = f"{PREBUILTS}/obmc-phosphor-image-evb-ast2600.mtd"
-ZEPHYR_ELF = f"{PREBUILTS}/zephyr.elf"
+OBMC_IMG = os.environ.get(
+    "OBMC_IMG", f"{PREBUILTS}/obmc-phosphor-image-evb-ast2600.mtd")
+ZEPHYR_ELF = os.environ.get("ZEPHYR_ELF", f"{PREBUILTS}/zephyr.elf")
 ZEPHYR_LOG = "/tmp/zephyr-console.log"
 OBMC_LOG = "/tmp/obmc-console.log"
 SSH_PORT = "3222"
@@ -28,6 +33,22 @@ PASSWORD = "0penBmc"
 
 ENV = dict(os.environ)
 ENV["LD_LIBRARY_PATH"] = f"{HOME}/local/lib/x86_64-linux-gnu:{HOME}/local/lib"
+
+# QEMU mtd images are written back in place, and the repo only ships the
+# compressed .mtd.gz, so decompress to a writable scratch copy if the raw
+# .mtd is missing. This lets the harness run directly from a fresh clone.
+if not os.path.exists(OBMC_IMG) and os.path.exists(OBMC_IMG + ".gz"):
+    import gzip
+    import shutil
+    print(f"[*] decompressing {OBMC_IMG}.gz -> {OBMC_IMG}", flush=True)
+    with gzip.open(OBMC_IMG + ".gz", "rb") as src, open(OBMC_IMG, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+if not os.path.exists(ZEPHYR_ELF) and os.path.exists(ZEPHYR_ELF + ".gz"):
+    import gzip
+    import shutil
+    print(f"[*] decompressing {ZEPHYR_ELF}.gz -> {ZEPHYR_ELF}", flush=True)
+    with gzip.open(ZEPHYR_ELF + ".gz", "rb") as src, open(ZEPHYR_ELF, "wb") as dst:
+        shutil.copyfileobj(src, dst)
 
 for p in (SOCK,):
     try:
