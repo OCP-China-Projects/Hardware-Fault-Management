@@ -1,0 +1,395 @@
+subsys/pmci/pldm/serial_bridge: add a RISC-V RERI RAS handler
+
+Add the firmware side of the RISC-V RERI (RAS Error-record Register Interface,
+v1.0) hardware-fault -> BMC reporting path to the PLDM serial_bridge sample.
+It pairs with the RERI error-injection shell (patch 0013) and the QEMU RERI
+error-bank device (patch 0012).
+
+On the abstract RERI RAS signal (delivered here as a PLIC interrupt, source 50,
+from the QEMU RERI device), the handler walks the bank the architected way:
+read valid_summary, then for each valid record read status_i / addr_info_i,
+classify the error severity, latch it, and clear status_i.v via control_i.sinv.
+The RERI RAS signal is level-based -- the modelled hardware holds the line
+asserted while any record has status_i.v == 1 -- so the handler must sinv to
+drop the interrupt, which it does on every serviced record.
+
+The latched severity is exposed to the BMC as a PLDM Type 2 numeric sensor
+(sensor id 2); the BMC's platform-mc discovers it from the PDR and polls it
+with GetSensorReading, so the injected hardware fault is observed over PLDM
+without the firmware pushing an event from interrupt context (the PLDM TX path
+is not ISR-safe). This is the only Type 2 path with a live per-poll callback,
+hence the RAS state rides on a numeric sensor rather than a state sensor.
+
+Interrupt binding is deliberately isolated in reri_ras_init(): the RAS
+decode/report body reads only architected RERI registers, so moving from a
+PLIC external interrupt to an AIA local interrupt (RERI high/low RAS signals
+-> local IRQ 43/35) would change only the IRQ_CONNECT glue, not the reporting
+logic.
+
+Changes
+  * src/reri_ras.c (new)
+      RAS ISR (valid_summary walk, severity latch, sinv acknowledge) + the
+      PLDM numeric-sensor read callback + reri_ras_init() (IRQ_CONNECT on
+      DT_IRQN(reri0)) + reri_ras_register_sensor().
+  * src/reri_ras.h (new)
+      RAS handler interface (init / register_sensor / get_event /
+      severity_now, struct reri_ras_event).
+  * src/main.c
+      register the RAS sensor before the Type 2 responder and call
+      reri_ras_init() after the responder is up.
+  * CMakeLists.txt
+      build src/reri_ras.c.
+
+Verified: builds clean for hifive_unleashed/fu540/u54 (Zephyr v4.3.0, SDK
+0.17.4); reri_ras_init / reri_ras_isr / reri_ras_register_sensor are present
+in the ELF and the RAS sensor is added to the Type 2 PDR repository.
+---
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/main.c b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+index ca123b9be59..c35292c8113 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/src/main.c
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/main.c
+@@ -39,6 +39,7 @@
+ #if defined(CONFIG_PLDM_TYPE_PLATFORM)
+ #include <zephyr/pmci/pldm/pldm_platform.h>
+ #include <libpldm/platform.h>
++#include "reri_ras.h"
+ #endif
+ 
+ LOG_MODULE_REGISTER(serial_bridge, LOG_LEVEL_INF);
+@@ -164,6 +165,14 @@ static int platform_responder_setup(void)
+ 		return rc;
+ 	}
+ 
++	/* RERI RAS severity sensor (sensor id 2): the BMC polls it to observe
++	 * injected hardware faults reported by the RAS handler. */
++	rc = reri_ras_register_sensor();
++	if (rc != 0) {
++		LOG_ERR("reri_ras_register_sensor rc=%d", rc);
++		return rc;
++	}
++
+ 	rc = pldm_platform_responder_register(&pldm);
+ 	if (rc != 0) {
+ 		LOG_ERR("pldm_platform_responder_register rc=%d", rc);
+@@ -214,6 +223,10 @@ int main(void)
+ 	if (rc != 0) {
+ 		return -1;
+ 	}
++
++	/* Bring up the RERI RAS handler: connect the RAS interrupt so injected
++	 * errors are decoded and surfaced on the RAS sensor. */
++	(void)reri_ras_init();
+ #endif
+ 
+ 	/*
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.c b/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.c
+new file mode 100644
+index 00000000000..957372c8fe4
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.c
+@@ -0,0 +1,240 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * RISC-V RERI RAS handler.
++ *
++ * This is the firmware side of the hardware-fault -> BMC reporting path. It
++ * connects to the abstract RERI RAS signal (delivered on this machine as a
++ * PLIC interrupt from the RERI error-bank device, QEMU patch 0012) and, on
++ * each RAS interrupt, walks the RERI bank the architected way:
++ *
++ *   valid_summary -> per valid record: status_i / addr_info_i / info_i
++ *   -> latch the error -> control_i.sinv to clear status_i.v and drop the
++ *      RAS signal.
++ *
++ * Because the RERI RAS signal is level-based (the modelled hardware holds the
++ * line asserted while any record has status_i.v == 1), the handler MUST clear
++ * v via sinv before returning, or the interrupt re-fires.
++ *
++ * The latched error is exposed to the BMC as a PLDM Type 2 numeric sensor
++ * whose present value is the RAS severity (0 none / low / high). pldmd's
++ * platform-mc discovers it via the PDR and polls it with GetSensorReading;
++ * the BMC therefore observes the injected hardware fault over PLDM without
++ * the firmware needing to push an event from interrupt context (the PLDM TX
++ * path is not ISR-safe).
++ *
++ * Interrupt binding is intentionally isolated here: the RAS decode/report
++ * body reads only architected RERI registers, so moving the platform from a
++ * PLIC external interrupt to an AIA local interrupt (RERI high/low RAS
++ * signals -> local IRQ 43/35) would only change the IRQ_CONNECT glue, not
++ * this file's reporting logic.
++ */
++
++#include <string.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/device.h>
++#include <zephyr/devicetree.h>
++#include <zephyr/irq.h>
++#include <zephyr/logging/log.h>
++#include <zephyr/sys/sys_io.h>
++#include <zephyr/sys/atomic.h>
++
++#include <zephyr/pmci/pldm/pldm_platform.h>
++#include <libpldm/platform.h>
++
++#include "reri_regs.h"
++#include "reri_ras.h"
++
++LOG_MODULE_REGISTER(reri_ras, LOG_LEVEL_INF);
++
++#define RERI_NODE DT_NODELABEL(reri0)
++
++#if DT_NODE_HAS_STATUS(RERI_NODE, okay)
++
++#define RERI_BASE ((mem_addr_t)DT_REG_ADDR(RERI_NODE))
++
++/* Number of records the handler scans (matches the QEMU device default). */
++#define RERI_MAX_RECORDS 1
++
++/*
++ * Latched RAS severity, published to the PLDM sensor read callback. Updated
++ * from the RAS ISR, read from a PLDM responder thread, so use an atomic.
++ *   0 = no error, RERI_PRI_LOW (1) = corrected, RERI_PRI_HIGH (2) = uncorrected
++ */
++static atomic_t reri_ras_severity;
++
++/* Last decoded record, kept for the shell "ras-status" dump / logging. */
++static struct reri_ras_event last_event;
++static struct k_spinlock last_event_lock;
++
++static inline uint64_t reri_rd(uint32_t off)
++{
++	return sys_read64(RERI_BASE + off);
++}
++
++static inline void reri_wr(uint32_t off, uint64_t val)
++{
++	sys_write64(val, RERI_BASE + off);
++}
++
++int reri_ras_get_event(struct reri_ras_event *out)
++{
++	k_spinlock_key_t key = k_spin_lock(&last_event_lock);
++
++	*out = last_event;
++	k_spin_unlock(&last_event_lock, key);
++	return (int)atomic_get(&reri_ras_severity);
++}
++
++int reri_ras_severity_now(void)
++{
++	return (int)atomic_get(&reri_ras_severity);
++}
++
++/* Decode one valid record, latch it, and clear status_i.v via control_i.sinv. */
++static void reri_handle_record(unsigned int i)
++{
++	uint32_t base = RERI_RECORD_OFFSET(i);
++	uint64_t status = reri_rd(base + RERI_REC_STATUS);
++	uint64_t addr;
++	uint64_t control;
++	int severity;
++
++	if (!(status & RERI_STATUS_V)) {
++		return;
++	}
++
++	addr = reri_rd(base + RERI_REC_ADDR_INFO);
++
++	if (status & (RERI_STATUS_UEC | RERI_STATUS_UED)) {
++		severity = RERI_PRI_HIGH;
++	} else if (status & RERI_STATUS_CE) {
++		severity = RERI_PRI_LOW;
++	} else {
++		severity = RERI_PRI_INFO;
++	}
++
++	/* Publish for the polling PLDM sensor and record for logging. */
++	atomic_set(&reri_ras_severity, severity);
++
++	k_spinlock_key_t key = k_spin_lock(&last_event_lock);
++
++	last_event.valid = true;
++	last_event.record = i;
++	last_event.status = status;
++	last_event.addr_info = addr;
++	last_event.ec = (uint8_t)RERI_STATUS_EC(status);
++	last_event.severity = severity;
++	k_spin_unlock(&last_event_lock, key);
++
++	LOG_ERR("RERI RAS: record %u %s error ec=0x%02x addr=0x%016llx "
++		"(status=0x%016llx)", i,
++		severity == RERI_PRI_HIGH ? "UNCORRECTED" :
++		severity == RERI_PRI_LOW ? "corrected" : "info",
++		last_event.ec, (unsigned long long)addr,
++		(unsigned long long)status);
++
++	/*
++	 * Acknowledge in hardware: control_i.sinv atomically clears status_i.v
++	 * and drops the RERI RAS signal (and thus the PLIC line). Preserve the
++	 * record's retained config bits by reading control first.
++	 */
++	control = reri_rd(base + RERI_REC_CONTROL);
++	reri_wr(base + RERI_REC_CONTROL, control | RERI_CONTROL_SINV);
++}
++
++static void reri_ras_isr(const void *arg)
++{
++	uint64_t summary;
++	unsigned int i;
++
++	ARG_UNUSED(arg);
++
++	summary = reri_rd(RERI_REG_VALID_SUMMARY);
++	if (!(summary & RERI_VS_SV_MASK)) {
++		/* Spurious / already cleared. */
++		return;
++	}
++
++	for (i = 0; i < RERI_MAX_RECORDS; i++) {
++		if (summary & RERI_VS_RECORD_BIT(i)) {
++			reri_handle_record(i);
++		}
++	}
++}
++
++/*
++ * DSP0249 entity type for a memory-class terminus and the sensor ID the BMC
++ * polls. Kept distinct from the temperature sensor (ID 1) in main.c.
++ */
++#define RAS_ENTITY_TYPE 66      /* DSP0249: memory controller / memory */
++#define RAS_SENSOR_ID   2
++
++/*
++ * PLDM numeric-sensor read callback (thread context). Returns the latched RAS
++ * severity so a polling BMC observes the injected fault. This is the only
++ * Type 2 path with a live per-poll callback, so the RAS state rides on it.
++ */
++static int reri_ras_sensor_read(const struct pldm_platform_sensor *sensor,
++				int32_t *reading)
++{
++	ARG_UNUSED(sensor);
++	*reading = (int32_t)atomic_get(&reri_ras_severity);
++	return 0;
++}
++
++static const struct pldm_platform_sensor reri_ras_sensor = {
++	.sensor_id = RAS_SENSOR_ID,
++	.entity_type = RAS_ENTITY_TYPE,
++	.entity_instance = 1,
++	.base_unit = PLDM_SENSOR_UNIT_NONE,
++	.unit_modifier = 0,
++	.read = reri_ras_sensor_read,
++};
++
++int reri_ras_register_sensor(void)
++{
++	return pldm_platform_add_numeric_sensor(&reri_ras_sensor);
++}
++
++int reri_ras_init(void)
++{
++	atomic_set(&reri_ras_severity, 0);
++
++	IRQ_CONNECT(DT_IRQN(RERI_NODE), DT_IRQ(RERI_NODE, priority),
++		    reri_ras_isr, NULL, 0);
++	irq_enable(DT_IRQN(RERI_NODE));
++
++	LOG_INF("RERI RAS handler ready: bank@0x%lx, IRQ %d",
++		(unsigned long)RERI_BASE, DT_IRQN(RERI_NODE));
++	return 0;
++}
++
++#else /* !reri0 okay */
++
++int reri_ras_init(void)
++{
++	LOG_WRN("reri0 node not enabled; RAS handler inactive");
++	return -ENODEV;
++}
++
++int reri_ras_register_sensor(void)
++{
++	return 0;
++}
++
++int reri_ras_get_event(struct reri_ras_event *out)
++{
++	memset(out, 0, sizeof(*out));
++	return 0;
++}
++
++int reri_ras_severity_now(void)
++{
++	return 0;
++}
++
++#endif /* DT_NODE_HAS_STATUS(RERI_NODE, okay) */
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.h b/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.h
+new file mode 100644
+index 00000000000..c90723afbd5
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/reri_ras.h
+@@ -0,0 +1,50 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * RISC-V RERI RAS handler public interface.
++ */
++
++#ifndef APP_RERI_RAS_H_
++#define APP_RERI_RAS_H_
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/** Last RAS error decoded from the RERI bank. */
++struct reri_ras_event {
++	bool valid;         /**< a RAS error has been latched          */
++	unsigned int record;/**< RERI record index                     */
++	uint64_t status;    /**< raw status_i                          */
++	uint64_t addr_info; /**< raw addr_info_i                       */
++	uint8_t ec;         /**< status_i.ec error code                */
++	int severity;       /**< RERI_PRI_INFO / _LOW / _HIGH          */
++};
++
++/**
++ * @brief Connect and enable the RERI RAS interrupt.
++ *
++ * @return 0 on success, -ENODEV if the reri0 node is not enabled.
++ */
++int reri_ras_init(void);
++
++/**
++ * @brief Register the RAS severity numeric sensor with the PLDM Type 2
++ *        responder. Call before pldm_platform_responder_register().
++ *
++ * @return 0 on success, negative errno otherwise.
++ */
++int reri_ras_register_sensor(void);
++
++/**
++ * @brief Copy the last latched RAS event.
++ *
++ * @return the current latched severity (0 if none).
++ */
++int reri_ras_get_event(struct reri_ras_event *out);
++
++/** @brief Current latched RAS severity (0 none / 1 low / 2 high). */
++int reri_ras_severity_now(void);
++
++#endif /* APP_RERI_RAS_H_ */
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+--- a/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
++++ b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+@@ -6,4 +6,4 @@
+ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+ project(pldm_serial_bridge)
+ 
+-target_sources(app PRIVATE src/main.c src/reri_shell.c)
++target_sources(app PRIVATE src/main.c src/reri_shell.c src/reri_ras.c)

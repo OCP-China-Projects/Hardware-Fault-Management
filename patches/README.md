@@ -42,6 +42,13 @@ needed.
 | 9 | `0009-subsys-pmci-pldm-set-MCTP-tag-owner-bit-on-requester.patch`   | Zephyr `hfm/pldm-type2` | `git apply` |
 | 10 | `0010-openbmc-evb-ast2600-kernel-fix-mctp-netlink-dump-busy-loop.patch` | OpenBMC (Yocto layers) | `git apply` |
 | 11 | `0011-subsys-pmci-mctp-clear-tag-owner-bit-on-control-response.patch`   | Zephyr `hfm/pldm-type2` | `git am` |
+| 13 | `0013-zephyr-serial_bridge-add-riscv-reri-injection-shell.patch`         | Zephyr `hfm/pldm-type2` | `git am` |
+| 14 | `0014-zephyr-serial_bridge-add-riscv-reri-ras-handler.patch`             | Zephyr `hfm/pldm-type2` | `git am` |
+
+Patches 0012-0014 form the RISC-V RERI hardware-fault-injection demo and apply
+together: 0012 (QEMU) adds the RERI error bank to `sifive_u`; 0013 (Zephyr)
+adds the `reri` injection shell; 0014 (Zephyr) adds the RAS handler that
+decodes the error and reports it over PLDM Type 2. Apply 0013 before 0014.
 
 Auxiliary (non-numbered) patches, applied per README Part 1/3 rather than
 as part of the MR stack:
@@ -49,6 +56,7 @@ as part of the MR stack:
 | Patch | Target | Purpose |
 |---|---|---|
 | `qemu-riscv-virt-allow-dw-i3c.patch` | QEMU 11.0.0 tree top | allow-list `TYPE_DW_I3C` on the `virt` platform bus + `select I3C/DW_I3C` |
+| `0012-qemu-sifive_u-add-riscv-reri-error-bank.patch` | QEMU 11.0.0 tree top | add a RISC-V RERI (v1.0) error bank device to `sifive_u` at 0x10080000, RAS signal wired to PLIC source 50 (hardware fault-injection demo) |
 | `zephyr-fu700-pll-lock-qemu-timeout.patch` | Zephyr tree | bound PLL_LOCK wait so the prebuilt `hifive_unmatched` ELF boots on QEMU |
 | `zephyr-qemu-hifive.overlay` | Zephyr build overlay | redirect `zephyr,sram` to DDR, shrink `ram0` to 256 MiB |
 | `openbmc-bitbake-disable_network-erofs.patch` | OpenBMC tree | let `do_unpack` run where `/proc/self/uid_map` is read-only |

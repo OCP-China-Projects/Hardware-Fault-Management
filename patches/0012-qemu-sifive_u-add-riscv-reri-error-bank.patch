@@ -1,0 +1,589 @@
+QEMU sifive_u: add a RISC-V RERI error bank device
+
+Add a RISC-V RERI (RAS Error-record Register Interface) error bank device
+and wire it into the sifive_u machine so guest firmware can exercise the
+hardware RAS reporting path in emulation.
+
+The device follows the RISC-V RERI Architecture Specification v1.0
+(ratified 2024-05-24): a 64-byte bank header followed by up to 63 error
+records of 64 bytes each.  It implements the architected error-injection
+mechanism -- program a record while status_i.v == 0, then write
+control_i.eid (bits 47:32) with a non-zero delay count; a QEMUTimer expires,
+hardware sets status_i.v = 1, updates valid_summary, and raises the abstract
+RERI RAS signal.  status_i is write-protected while valid, and control_i.sinv
+atomically invalidates a record (the collect-side handshake).
+
+RERI leaves physical delivery of its abstract RAS signal to the platform.
+On sifive_u we expose a single sysbus IRQ wired to a free PLIC source (50);
+a real RISC-V AIA platform would instead route it to the high/low-priority
+RAS local interrupt (causes 43/35).  Note RERI injects an error *record* to
+drive the reporting path -- it does not corrupt real memory.
+
+Apply from the QEMU 11.0.0 source tree top (https://download.qemu.org/);
+this machine has no upstream git history so the change ships as a source
+patch, like qemu-riscv-virt-allow-dw-i3c.patch.
+
+---
+
+### hw/misc/sifive_u_reri.c (new file)
+diff --git a/hw/misc/sifive_u_reri.c b/hw/misc/sifive_u_reri.c
+new file mode 100644
+--- /dev/null
++++ b/hw/misc/sifive_u_reri.c
+@@ -0,0 +1,357 @@
++/*
++ * RISC-V RERI (RAS Error-record Register Interface) error bank for QEMU.
++ *
++ * Models one RERI error bank per the RISC-V RERI Architecture Specification
++ * v1.0 (ratified 2024-05-24): a 64-byte bank header followed by up to 63
++ * error records of 64 bytes each.  Guest software injects a synthetic error
++ * *record* using the architected mechanism: program the record while
++ * status_i.v == 0, then write control_i.eid (bits 47:32) with a non-zero
++ * delay count.  The delay counter expires, hardware sets status_i.v = 1,
++ * marks the record valid in valid_summary, and raises the abstract RERI RAS
++ * signal.  Here that signal is a single sysbus IRQ wired to the platform
++ * interrupt controller (the PLIC on sifive_u).
++ *
++ * Note: RERI injects an error *record* to exercise the RAS reporting path;
++ * it does not corrupt real memory.  Delivering the abstract RAS signal as a
++ * high- vs low-priority interrupt is platform specific and out of RERI's
++ * scope; on this machine we drive a single PLIC line and log the selected
++ * signal class.
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2 or later, as published by the Free Software Foundation.
++ */
++
++#include "qemu/osdep.h"
++#include "qemu/log.h"
++#include "qapi/error.h"
++#include "hw/core/irq.h"
++#include "hw/core/qdev-properties.h"
++#include "hw/misc/sifive_u_reri.h"
++#include "migration/vmstate.h"
++
++/* status_i bit fields (RERI v1.0 §2.4.2). */
++#define STATUS_V_SHIFT     0
++#define STATUS_V_MASK      (1ULL << STATUS_V_SHIFT)
++#define STATUS_CE_MASK     (1ULL << 1)
++#define STATUS_UED_MASK    (1ULL << 2)
++#define STATUS_UEC_MASK    (1ULL << 3)
++#define STATUS_EC_SHIFT    24
++#define STATUS_EC_MASK     (0xFFULL << STATUS_EC_SHIFT)
++
++/* control_i bit fields (RERI v1.0 §2.4.1). */
++#define CONTROL_ELSE_MASK  (1ULL << 0)
++#define CONTROL_CES_SHIFT  2
++#define CONTROL_CES_MASK   (0x3ULL << CONTROL_CES_SHIFT)
++#define CONTROL_UEDS_SHIFT 4
++#define CONTROL_UEDS_MASK  (0x3ULL << CONTROL_UEDS_SHIFT)
++#define CONTROL_UECS_SHIFT 6
++#define CONTROL_UECS_MASK  (0x3ULL << CONTROL_UECS_SHIFT)
++#define CONTROL_EID_SHIFT  32
++#define CONTROL_EID_MASK   (0xFFFFULL << CONTROL_EID_SHIFT)
++#define CONTROL_SINV_MASK  (1ULL << 48)
++#define CONTROL_SRDP_MASK  (1ULL << 49)
++/* Bits that guest software owns and we retain across writes. */
++#define CONTROL_KEEP_MASK  (CONTROL_ELSE_MASK | (1ULL << 1) | \
++                            CONTROL_CES_MASK | CONTROL_UEDS_MASK | \
++                            CONTROL_UECS_MASK)
++
++/* bank_info: inst_id[15:0], n_err_recs[21:16], layout[23:22], version[63:56]. */
++#define BANK_INFO_VERSION_1 (0x01ULL << 56)
++
++static const char *reri_signal_name(unsigned sel)
++{
++    switch (sel) {
++    case 0:  return "disabled";
++    case 1:  return "low-priority RAS signal";
++    case 2:  return "high-priority RAS signal";
++    default: return "platform-specific";
++    }
++}
++
++static hwaddr reri_record_base(unsigned index)
++{
++    return RERI_HEADER_SIZE + (hwaddr)index * RERI_RECORD_SIZE;
++}
++
++/* Recompute valid_summary from the per-record valid bits and drive the IRQ. */
++static void reri_refresh_summary(SiFiveURERIState *s)
++{
++    uint64_t summary = 0;
++    bool any_valid = false;
++    unsigned i;
++
++    for (i = 0; i < s->num_records; i++) {
++        if (s->recs[i].status & STATUS_V_MASK) {
++            summary |= 1ULL << (i + 1);
++            any_valid = true;
++        }
++    }
++    /* sv (bit 0) set when at least one record is valid. */
++    s->valid_summary = summary | (any_valid ? 1ULL : 0ULL);
++    qemu_set_irq(s->irq, any_valid);
++}
++
++/* control_i.eid delay counter expired: mark the record valid, raise signal. */
++static void reri_eid_expired(void *opaque)
++{
++    SiFiveURERIRecord *rec = opaque;
++    SiFiveURERIState *s = rec->bank;
++    unsigned sel = 0;
++
++    if (rec->status & STATUS_UEC_MASK) {
++        sel = (rec->control & CONTROL_UECS_MASK) >> CONTROL_UECS_SHIFT;
++    } else if (rec->status & STATUS_UED_MASK) {
++        sel = (rec->control & CONTROL_UEDS_MASK) >> CONTROL_UEDS_SHIFT;
++    } else if (rec->status & STATUS_CE_MASK) {
++        sel = (rec->control & CONTROL_CES_MASK) >> CONTROL_CES_SHIFT;
++    }
++
++    rec->status |= STATUS_V_MASK;
++    rec->control &= ~CONTROL_EID_MASK;
++
++    qemu_log_mask(LOG_TRACE,
++                  "%s: record %u injected (ec=0x%02x, %s)\n", __func__,
++                  rec->index,
++                  (unsigned)((rec->status & STATUS_EC_MASK) >> STATUS_EC_SHIFT),
++                  reri_signal_name(sel));
++
++    reri_refresh_summary(s);
++}
++
++static void reri_arm_injection(SiFiveURERIState *s, SiFiveURERIRecord *rec)
++{
++    uint64_t eid = (rec->control & CONTROL_EID_MASK) >> CONTROL_EID_SHIFT;
++    int64_t now;
++
++    if (eid == 0 || (rec->status & STATUS_V_MASK)) {
++        return;
++    }
++    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
++    timer_mod(&rec->eid_timer, now + (int64_t)(eid * s->eid_tick_ns));
++}
++
++/* control_i.sinv atomic invalidate: clear the record's valid state. */
++static void reri_status_invalidate(SiFiveURERIState *s, SiFiveURERIRecord *rec)
++{
++    rec->status &= ~STATUS_V_MASK;
++    rec->control &= ~CONTROL_SINV_MASK;
++    reri_refresh_summary(s);
++}
++
++static uint64_t reri_read(void *opaque, hwaddr addr, unsigned size)
++{
++    SiFiveURERIState *s = SIFIVE_U_RERI(opaque);
++    SiFiveURERIRecord *rec;
++    hwaddr off;
++    unsigned index;
++
++    if (addr < RERI_HEADER_SIZE) {
++        switch (addr) {
++        case RERI_REG_VENDOR_N_IMP_ID:
++            return s->vendor_n_imp_id;
++        case RERI_REG_BANK_INFO:
++            return BANK_INFO_VERSION_1 |
++                   ((uint64_t)s->num_records << 16);
++        case RERI_REG_VALID_SUMMARY:
++            return s->valid_summary;
++        case RERI_REG_CUSTOM:
++            return 0;
++        default:
++            return 0;
++        }
++    }
++
++    index = (addr - RERI_HEADER_SIZE) / RERI_RECORD_SIZE;
++    off = (addr - RERI_HEADER_SIZE) % RERI_RECORD_SIZE;
++    if (index >= s->num_records) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: read of nonexistent record %u\n", __func__, index);
++        return 0;
++    }
++    rec = &s->recs[index];
++
++    switch (off) {
++    case RERI_REC_CONTROL:    return rec->control;
++    case RERI_REC_STATUS:     return rec->status;
++    case RERI_REC_ADDR_INFO:  return rec->addr_info;
++    case RERI_REC_INFO:       return rec->info;
++    case RERI_REC_SUPPL_INFO: return rec->suppl_info;
++    case RERI_REC_TIMESTAMP:  return rec->timestamp;
++    default:                  return 0;
++    }
++}
++
++static void reri_write(void *opaque, hwaddr addr, uint64_t val, unsigned size)
++{
++    SiFiveURERIState *s = SIFIVE_U_RERI(opaque);
++    SiFiveURERIRecord *rec;
++    hwaddr off;
++    unsigned index;
++    bool v_set;
++
++    if (addr < RERI_HEADER_SIZE) {
++        /* Header is read-only / hardware-maintained. */
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: write to read-only header addr=0x%" HWADDR_PRIx "\n",
++                      __func__, addr);
++        return;
++    }
++
++    index = (addr - RERI_HEADER_SIZE) / RERI_RECORD_SIZE;
++    off = (addr - RERI_HEADER_SIZE) % RERI_RECORD_SIZE;
++    if (index >= s->num_records) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: write to nonexistent record %u\n", __func__, index);
++        return;
++    }
++    rec = &s->recs[index];
++    v_set = rec->status & STATUS_V_MASK;
++
++    switch (off) {
++    case RERI_REC_CONTROL:
++        /* sinv/srdp are one-shot commands; the rest are retained config. */
++        if (val & CONTROL_SINV_MASK) {
++            reri_status_invalidate(s, rec);
++            return;
++        }
++        rec->control = (rec->control & ~(CONTROL_KEEP_MASK | CONTROL_EID_MASK)) |
++                       (val & (CONTROL_KEEP_MASK | CONTROL_EID_MASK));
++        reri_arm_injection(s, rec);
++        break;
++    case RERI_REC_STATUS:
++        /* RERI v1.0: software must not write status_i while valid. */
++        if (v_set) {
++            return;
++        }
++        rec->status = val;
++        break;
++    case RERI_REC_ADDR_INFO:
++        if (v_set) {
++            return;
++        }
++        rec->addr_info = val;
++        break;
++    case RERI_REC_INFO:
++        if (v_set) {
++            return;
++        }
++        rec->info = val;
++        break;
++    case RERI_REC_SUPPL_INFO:
++        if (v_set) {
++            return;
++        }
++        rec->suppl_info = val;
++        break;
++    case RERI_REC_TIMESTAMP:
++        rec->timestamp = val;
++        break;
++    default:
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: bad record offset 0x%" HWADDR_PRIx "\n",
++                      __func__, off);
++        break;
++    }
++}
++
++static const MemoryRegionOps reri_ops = {
++    .read = reri_read,
++    .write = reri_write,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 8,
++        .max_access_size = 8,
++    },
++    .valid = {
++        .min_access_size = 4,
++        .max_access_size = 8,
++    },
++};
++
++static void reri_reset(DeviceState *dev)
++{
++    SiFiveURERIState *s = SIFIVE_U_RERI(dev);
++    unsigned i;
++
++    for (i = 0; i < s->num_records; i++) {
++        timer_del(&s->recs[i].eid_timer);
++        s->recs[i].control = 0;
++        s->recs[i].status = 0;
++        s->recs[i].addr_info = 0;
++        s->recs[i].info = 0;
++        s->recs[i].suppl_info = 0;
++        s->recs[i].timestamp = 0;
++    }
++    s->valid_summary = 0;
++    qemu_set_irq(s->irq, 0);
++}
++
++static void reri_realize(DeviceState *dev, Error **errp)
++{
++    SiFiveURERIState *s = SIFIVE_U_RERI(dev);
++    uint64_t region_size;
++    unsigned i;
++
++    if (s->num_records < 1 || s->num_records > RERI_MAX_RECORDS) {
++        error_setg(errp, "num-records must be between 1 and %d",
++                   RERI_MAX_RECORDS);
++        return;
++    }
++
++    s->recs = g_new0(SiFiveURERIRecord, s->num_records);
++    for (i = 0; i < s->num_records; i++) {
++        s->recs[i].bank = s;
++        s->recs[i].index = i;
++        timer_init_ns(&s->recs[i].eid_timer, QEMU_CLOCK_VIRTUAL,
++                      reri_eid_expired, &s->recs[i]);
++    }
++
++    region_size = RERI_HEADER_SIZE +
++                  (uint64_t)s->num_records * RERI_RECORD_SIZE;
++    memory_region_init_io(&s->mmio, OBJECT(s), &reri_ops, s,
++                          TYPE_SIFIVE_U_RERI, region_size);
++    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
++    sysbus_init_irq(SYS_BUS_DEVICE(dev), &s->irq);
++}
++
++static void reri_unrealize(DeviceState *dev)
++{
++    SiFiveURERIState *s = SIFIVE_U_RERI(dev);
++    unsigned i;
++
++    for (i = 0; i < s->num_records; i++) {
++        timer_del(&s->recs[i].eid_timer);
++    }
++    g_free(s->recs);
++}
++
++static const Property reri_properties[] = {
++    DEFINE_PROP_UINT32("num-records", SiFiveURERIState, num_records, 1),
++    DEFINE_PROP_UINT64("eid-tick-ns", SiFiveURERIState, eid_tick_ns, 1000),
++    DEFINE_PROP_UINT64("vendor-n-imp-id", SiFiveURERIState, vendor_n_imp_id, 0),
++};
++
++static void reri_class_init(ObjectClass *oc, const void *data)
++{
++    DeviceClass *dc = DEVICE_CLASS(oc);
++
++    dc->realize = reri_realize;
++    dc->unrealize = reri_unrealize;
++    device_class_set_legacy_reset(dc, reri_reset);
++    device_class_set_props(dc, reri_properties);
++}
++
++static const TypeInfo reri_info = {
++    .name          = TYPE_SIFIVE_U_RERI,
++    .parent        = TYPE_SYS_BUS_DEVICE,
++    .instance_size = sizeof(SiFiveURERIState),
++    .class_init    = reri_class_init,
++};
++
++static void reri_register_types(void)
++{
++    type_register_static(&reri_info);
++}
++
++type_init(reri_register_types)
+
+### include/hw/misc/sifive_u_reri.h (new file)
+diff --git a/include/hw/misc/sifive_u_reri.h b/include/hw/misc/sifive_u_reri.h
+new file mode 100644
+--- /dev/null
++++ b/include/hw/misc/sifive_u_reri.h
+@@ -0,0 +1,80 @@
++/*
++ * RISC-V RERI (RAS Error-record Register Interface) error bank.
++ *
++ * Models a single RERI error bank as defined by the RISC-V RERI
++ * Architecture Specification v1.0 (ratified 2024-05-24): a 64-byte bank
++ * header followed by up to 63 error records of 64 bytes each.  The device
++ * implements the standard error-injection mechanism (control_i.eid delay
++ * counter) so that guest software can inject an *error record* by writing
++ * the bank registers, which is exactly how injection works on real RERI
++ * hardware.  It does not fault real memory; it drives the RAS reporting
++ * path only.
++ *
++ * The abstract RERI "RAS signal" is delivered here through a single sysbus
++ * IRQ line, wired to the platform interrupt controller by the machine
++ * (on sifive_u this is the PLIC; a real AIA platform would route it to a
++ * high/low-priority RAS local interrupt instead).
++ *
++ * This program is free software; you can redistribute it and/or modify it
++ * under the terms and conditions of the GNU General Public License,
++ * version 2 or later, as published by the Free Software Foundation.
++ */
++
++#ifndef HW_MISC_SIFIVE_U_RERI_H
++#define HW_MISC_SIFIVE_U_RERI_H
++
++#include "hw/core/sysbus.h"
++#include "qemu/timer.h"
++#include "qom/object.h"
++
++#define TYPE_SIFIVE_U_RERI "riscv.sifive.u.reri"
++OBJECT_DECLARE_SIMPLE_TYPE(SiFiveURERIState, SIFIVE_U_RERI)
++
++/* Bank layout (RERI v1.0 §2.3, §2.4). */
++#define RERI_HEADER_SIZE   0x40
++#define RERI_RECORD_SIZE   0x40
++#define RERI_MAX_RECORDS   63
++
++/* Bank header register offsets. */
++#define RERI_REG_VENDOR_N_IMP_ID 0x00
++#define RERI_REG_BANK_INFO       0x08
++#define RERI_REG_VALID_SUMMARY   0x10
++#define RERI_REG_CUSTOM          0x38
++
++/* Per-record register offsets, relative to the record base. */
++#define RERI_REC_CONTROL    0x00
++#define RERI_REC_STATUS     0x08
++#define RERI_REC_ADDR_INFO  0x10
++#define RERI_REC_INFO       0x18
++#define RERI_REC_SUPPL_INFO 0x20
++#define RERI_REC_TIMESTAMP  0x28
++
++typedef struct SiFiveURERIRecord {
++    uint64_t control;      /* control_i    */
++    uint64_t status;       /* status_i     */
++    uint64_t addr_info;    /* addr_info_i  */
++    uint64_t info;         /* info_i       */
++    uint64_t suppl_info;   /* suppl_info_i */
++    uint64_t timestamp;    /* timestamp_i  */
++    QEMUTimer eid_timer;   /* control_i.eid delay counter                 */
++    struct SiFiveURERIState *bank;  /* back-pointer for timer callback     */
++    unsigned index;                 /* record index within the bank        */
++} SiFiveURERIRecord;
++
++struct SiFiveURERIState {
++    /*< private >*/
++    SysBusDevice parent_obj;
++
++    /*< public >*/
++    MemoryRegion mmio;
++    qemu_irq irq;              /* abstract RERI RAS signal -> PLIC          */
++
++    uint64_t vendor_n_imp_id;  /* header: vendor_n_imp_id (RO)              */
++    uint64_t valid_summary;    /* header: valid_summary (HW-maintained)     */
++
++    uint32_t num_records;      /* property: number of error records (1..63) */
++    uint64_t eid_tick_ns;      /* property: ns per eid count (impl-defined)  */
++    SiFiveURERIRecord *recs;   /* num_records entries                        */
++};
++
++#endif /* HW_MISC_SIFIVE_U_RERI_H */
+
+diff --git a/hw/misc/meson.build b/hw/misc/meson.build
+--- a/hw/misc/meson.build
++++ b/hw/misc/meson.build
+@@ -35,6 +35,7 @@
+ system_ss.add(when: 'CONFIG_SIFIVE_E_AON', if_true: files('sifive_e_aon.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_U_OTP', if_true: files('sifive_u_otp.c'))
+ system_ss.add(when: 'CONFIG_SIFIVE_U_PRCI', if_true: files('sifive_u_prci.c'))
++system_ss.add(when: 'CONFIG_SIFIVE_U_RERI', if_true: files('sifive_u_reri.c'))
+ 
+ subdir('macio')
+ 
+
+diff --git a/hw/misc/Kconfig b/hw/misc/Kconfig
+--- a/hw/misc/Kconfig
++++ b/hw/misc/Kconfig
+@@ -229,6 +229,9 @@
+ config SIFIVE_U_PRCI
+     bool
+ 
++config SIFIVE_U_RERI
++    bool
++
+ config VIRT_CTRL
+     bool
+ 
+
+diff --git a/hw/riscv/Kconfig b/hw/riscv/Kconfig
+--- a/hw/riscv/Kconfig
++++ b/hw/riscv/Kconfig
+@@ -107,6 +107,7 @@
+     select SIFIVE_UART
+     select SIFIVE_U_OTP
+     select SIFIVE_U_PRCI
++    select SIFIVE_U_RERI
+     select SIFIVE_PWM
+     select SSI_M25P80
+     select SSI_SD
+
+diff --git a/hw/riscv/sifive_u.c b/hw/riscv/sifive_u.c
+--- a/hw/riscv/sifive_u.c
++++ b/hw/riscv/sifive_u.c
+@@ -82,6 +82,7 @@
+     [SIFIVE_U_DEV_QSPI2] =    { 0x10050000,     0x1000 },
+     [SIFIVE_U_DEV_GPIO] =     { 0x10060000,     0x1000 },
+     [SIFIVE_U_DEV_OTP] =      { 0x10070000,     0x1000 },
++    [SIFIVE_U_DEV_RERI] =     { 0x10080000,     0x1000 },
+     [SIFIVE_U_DEV_GEM] =      { 0x10090000,     0x2000 },
+     [SIFIVE_U_DEV_GEM_MGMT] = { 0x100a0000,     0x1000 },
+     [SIFIVE_U_DEV_DMC] =      { 0x100b0000,    0x10000 },
+@@ -773,6 +774,7 @@
+ 
+     object_initialize_child(obj, "prci", &s->prci, TYPE_SIFIVE_U_PRCI);
+     object_initialize_child(obj, "otp", &s->otp, TYPE_SIFIVE_U_OTP);
++    object_initialize_child(obj, "reri", &s->reri, TYPE_SIFIVE_U_RERI);
+     object_initialize_child(obj, "gem", &s->gem, TYPE_CADENCE_GEM);
+     object_initialize_child(obj, "gpio", &s->gpio, TYPE_SIFIVE_GPIO);
+     object_initialize_child(obj, "pdma", &s->dma, TYPE_SIFIVE_PDMA);
+@@ -895,6 +897,15 @@
+     }
+     sysbus_mmio_map(SYS_BUS_DEVICE(&s->otp), 0, memmap[SIFIVE_U_DEV_OTP].base);
+ 
++    /* RISC-V RERI error bank; its RAS signal is wired to the PLIC. */
++    if (!sysbus_realize(SYS_BUS_DEVICE(&s->reri), errp)) {
++        return;
++    }
++    sysbus_mmio_map(SYS_BUS_DEVICE(&s->reri), 0,
++                    memmap[SIFIVE_U_DEV_RERI].base);
++    sysbus_connect_irq(SYS_BUS_DEVICE(&s->reri), 0,
++                       qdev_get_gpio_in(DEVICE(s->plic), SIFIVE_U_RERI_IRQ));
++
+     qemu_configure_nic_device(DEVICE(&s->gem), true, NULL);
+     object_property_set_int(OBJECT(&s->gem), "revision", GEM_REVISION,
+                             &error_abort);
+
+diff --git a/include/hw/riscv/sifive_u.h b/include/hw/riscv/sifive_u.h
+--- a/include/hw/riscv/sifive_u.h
++++ b/include/hw/riscv/sifive_u.h
+@@ -28,6 +28,7 @@
+ #include "hw/gpio/sifive_gpio.h"
+ #include "hw/misc/sifive_u_otp.h"
+ #include "hw/misc/sifive_u_prci.h"
++#include "hw/misc/sifive_u_reri.h"
+ #include "hw/ssi/sifive_spi.h"
+ #include "hw/timer/sifive_pwm.h"
+ 
+@@ -48,6 +49,7 @@
+     SiFiveUPRCIState prci;
+     SIFIVEGPIOState gpio;
+     SiFiveUOTPState otp;
++    SiFiveURERIState reri;
+     SiFivePDMAState dma;
+     SiFiveSPIState spi0;
+     SiFiveSPIState spi2;
+@@ -96,7 +98,8 @@
+     SIFIVE_U_DEV_GEM,
+     SIFIVE_U_DEV_GEM_MGMT,
+     SIFIVE_U_DEV_PWM0,
+-    SIFIVE_U_DEV_PWM1
++    SIFIVE_U_DEV_PWM1,
++    SIFIVE_U_DEV_RERI
+ };
+ 
+ enum {
+@@ -138,6 +141,7 @@
+     SIFIVE_U_PWM1_IRQ1 = 47,
+     SIFIVE_U_PWM1_IRQ2 = 48,
+     SIFIVE_U_PWM1_IRQ3 = 49,
++    SIFIVE_U_RERI_IRQ = 50,
+     SIFIVE_U_QSPI0_IRQ = 51,
+     SIFIVE_U_GEM_IRQ = 53
+ };

@@ -1,0 +1,382 @@
+subsys/pmci/pldm/serial_bridge: add a RISC-V RERI error-injection shell
+
+Add a shell-driven RISC-V RERI (RAS Error-record Register Interface, v1.0)
+error injector to the PLDM serial_bridge sample, so the hardware-fault ->
+firmware -> BMC path can be exercised end to end on QEMU sifive_u.
+
+This is the Zephyr (fault-injection) half of the RERI demo. It pairs with the
+QEMU RERI error-bank device (patch 0012), which maps a standard RERI bank at
+0x10080000 and wires its abstract RAS signal to PLIC source 50.
+
+Changes
+  * src/reri_regs.h (new)
+      RERI v1.0 register map shared by the shell and the RAS handler: 64-byte
+      header (vendor_n_imp_id / bank_info / valid_summary) + 64-byte error
+      records (control_i / status_i / addr_info_i / info_i / suppl_info_i /
+      timestamp_i), with the status_i / control_i bit-fields and the error-code
+      (EC) / RAS-signal (disabled/low/high/platform) encodings from the spec.
+  * src/reri_shell.c (new)
+      "reri" shell command tree. Injection follows the architected mechanism
+      only -- no private registers: it programs status_i / addr_info_i, then
+      arms control_i.eid so the modelled hardware counts down, sets
+      status_i.v=1, updates valid_summary and raises the RAS signal.
+        reri sdram-ue [addr]  inject an uncorrectable SDRAM data error
+                              (EC=SYSTEM_MEMORY_DATA, UEC, PRI=high, UECS=high)
+        reri sdram-ce [addr]  inject a corrected SDRAM data error
+                              (CE, PRI=low, CES=low)
+        reri dump             dump the bank header + record 0
+      MMIO access uses sys_read64/sys_write64 at DT_REG_ADDR(reri0).
+  * boards/hifive_unleashed_fu540_u54.overlay
+      add the reri0 node (compatible "sifive,reri", reg <0x10080000 0x80>,
+      interrupt-parent &plic, interrupts <50 1>).
+  * dts/bindings/sifive,reri.yaml (new)
+      minimal binding for the "sifive,reri" compatible (reg + interrupts).
+  * prj.conf
+      CONFIG_SHELL=y. The shell console stays on uart0; uart1 remains the
+      dedicated MCTP link, so the shell does not disturb the bridge.
+  * CMakeLists.txt
+      build src/reri_shell.c.
+
+Verified: builds clean for hifive_unleashed/fu540/u54 (Zephyr v4.3.0, SDK
+0.17.4); the generated devicetree exposes /soc/reri@10080000 with reg and IRQ,
+CONFIG_DT_HAS_SIFIVE_RERI_ENABLED=1, and the "reri" command is registered in
+the ELF (shell_cmd_reri / reri_cmds).
+---
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+index 36f08732d9c..43456f3398f 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
++++ b/samples/subsys/pmci/pldm/serial_bridge/CMakeLists.txt
+@@ -6,4 +6,4 @@ cmake_minimum_required(VERSION 3.20.0)
+ find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+ project(pldm_serial_bridge)
+ 
+-target_sources(app PRIVATE src/main.c)
++target_sources(app PRIVATE src/main.c src/reri_shell.c)
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay b/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
+index 49db00d53f3..0a17c6215c1 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
++++ b/samples/subsys/pmci/pldm/serial_bridge/boards/hifive_unleashed_fu540_u54.overlay
+@@ -33,3 +33,19 @@
+ &ram0 {
+ 	reg = <0x80000000 0x10000000>;   /* 256 MiB */
+ };
++
++/*
++ * RISC-V RERI (RAS Error-record Register Interface) error bank, provided by
++ * the sifive_u RERI QEMU device (patch 0012) at 0x10080000. Its abstract RAS
++ * signal is wired to PLIC source 50. Used by the error-injection shell and
++ * the RAS handler to demonstrate the hardware fault -> PLDM reporting path.
++ */
++&{/soc} {
++	reri0: reri@10080000 {
++		compatible = "sifive,reri";
++		reg = <0x10080000 0x80>;
++		interrupt-parent = <&plic>;
++		interrupts = <50 1>;
++		status = "okay";
++	};
++};
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/dts/bindings/sifive,reri.yaml b/samples/subsys/pmci/pldm/serial_bridge/dts/bindings/sifive,reri.yaml
+new file mode 100644
+index 00000000000..67ed9e7f7e9
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/dts/bindings/sifive,reri.yaml
+@@ -0,0 +1,19 @@
++# Copyright (c) 2026 OCP Hardware-Fault-Management project
++# SPDX-License-Identifier: Apache-2.0
++
++description: |
++  RISC-V RERI (RAS Error-record Register Interface) error bank.
++
++  Models a RERI v1.0 error bank as an MMIO device: a 64-byte header followed
++  by up to 63 error records of 64 bytes each. The abstract RERI RAS signal is
++  delivered as a single interrupt (wired to the PLIC on the sifive_u machine).
++
++compatible: "sifive,reri"
++
++include: base.yaml
++
++properties:
++  reg:
++    required: true
++  interrupts:
++    required: true
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/prj.conf b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+index a95e73426c8..c56b1a49235 100644
+--- a/samples/subsys/pmci/pldm/serial_bridge/prj.conf
++++ b/samples/subsys/pmci/pldm/serial_bridge/prj.conf
+@@ -27,3 +27,8 @@ CONFIG_LOG_BUFFER_SIZE=4096
+ CONFIG_MCTP_LOG_LEVEL_INF=y
+ CONFIG_PLDM_LOG_LEVEL_INF=y
+ CONFIG_MAIN_STACK_SIZE=4096
++
++# RERI error-injection shell (reri sdram-ue / sdram-ce / dump) on the uart0
++# console. uart1 stays dedicated to the MCTP link, so the shell does not
++# interfere with the bridge.
++CONFIG_SHELL=y
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/reri_regs.h b/samples/subsys/pmci/pldm/serial_bridge/src/reri_regs.h
+new file mode 100644
+index 00000000000..2d1c2405dc5
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/reri_regs.h
+@@ -0,0 +1,110 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * RISC-V RERI (RAS Error-record Register Interface) v1.0 register layout.
++ *
++ * Shared by the error-injection shell (reri_shell.c) and the RAS handler
++ * (reri_ras.c). Offsets and bit fields follow the RISC-V RERI Architecture
++ * Specification v1.0 (ratified 2024-05-24): a 64-byte bank header followed
++ * by up to 63 error records of 64 bytes each.
++ */
++
++#ifndef APP_RERI_REGS_H_
++#define APP_RERI_REGS_H_
++
++#include <stdint.h>
++
++/* Bank geometry (RERI v1.0 §2.3). */
++#define RERI_HEADER_SIZE   0x40U
++#define RERI_RECORD_SIZE   0x40U
++
++/* Bank header register offsets. */
++#define RERI_REG_VENDOR_N_IMP_ID 0x00U
++#define RERI_REG_BANK_INFO       0x08U
++#define RERI_REG_VALID_SUMMARY   0x10U
++
++/* Per-record register offsets, relative to the record base. */
++#define RERI_REC_CONTROL    0x00U
++#define RERI_REC_STATUS     0x08U
++#define RERI_REC_ADDR_INFO  0x10U
++#define RERI_REC_INFO       0x18U
++#define RERI_REC_SUPPL_INFO 0x20U
++#define RERI_REC_TIMESTAMP  0x28U
++
++/* Absolute offset of record i within the bank. */
++#define RERI_RECORD_OFFSET(i) (RERI_HEADER_SIZE + (uint32_t)(i) * RERI_RECORD_SIZE)
++
++/* valid_summary (RERI v1.0 §2.3): sv[0], then one valid bit per record. */
++#define RERI_VS_SV_MASK        (1ULL << 0)
++#define RERI_VS_RECORD_BIT(i)  (1ULL << ((i) + 1))
++
++/* status_i bit fields (RERI v1.0 §2.4.2). */
++#define RERI_STATUS_V     (1ULL << 0)   /* valid                        */
++#define RERI_STATUS_CE    (1ULL << 1)   /* corrected error              */
++#define RERI_STATUS_UED   (1ULL << 2)   /* uncorrected, deferred        */
++#define RERI_STATUS_UEC   (1ULL << 3)   /* uncorrected, critical        */
++#define RERI_STATUS_PRI_SHIFT 4
++#define RERI_STATUS_PRI_MASK  (0x3ULL << RERI_STATUS_PRI_SHIFT)
++#define RERI_STATUS_MO    (1ULL << 6)   /* multiple occurrence          */
++#define RERI_STATUS_C     (1ULL << 7)   /* containable                  */
++#define RERI_STATUS_TT_SHIFT  8
++#define RERI_STATUS_TT_MASK   (0x7ULL << RERI_STATUS_TT_SHIFT)
++#define RERI_STATUS_IV    (1ULL << 11)  /* info_i valid                 */
++#define RERI_STATUS_AIT_SHIFT 12
++#define RERI_STATUS_AIT_MASK  (0xFULL << RERI_STATUS_AIT_SHIFT)
++#define RERI_STATUS_EC_SHIFT  24
++#define RERI_STATUS_EC_MASK   (0xFFULL << RERI_STATUS_EC_SHIFT)
++#define RERI_STATUS_CEC_SHIFT 48
++#define RERI_STATUS_CEC_MASK  (0xFFFFULL << RERI_STATUS_CEC_SHIFT)
++
++#define RERI_STATUS_EC(s)  (((s) >> RERI_STATUS_EC_SHIFT) & 0xFFULL)
++#define RERI_STATUS_AIT(s) (((s) >> RERI_STATUS_AIT_SHIFT) & 0xFULL)
++
++/* status_i.pri severity levels. */
++#define RERI_PRI_INFO 0
++#define RERI_PRI_LOW  1
++#define RERI_PRI_HIGH 2
++
++/* status_i.ait address types. */
++#define RERI_AIT_NONE 0
++#define RERI_AIT_SPA  1  /* supervisor physical address */
++#define RERI_AIT_GPA  2  /* guest physical address      */
++#define RERI_AIT_VA   3  /* virtual address             */
++
++/* status_i.ec error codes (RERI v1.0 §2.4.2 Table). */
++#define RERI_EC_NONE                 0x00
++#define RERI_EC_POISONED_ACCESS      0x02
++#define RERI_EC_CACHE_BLOCK_DATA     0x03
++#define RERI_EC_TLB_PWC_DATA         0x09
++#define RERI_EC_SYSTEM_MEMORY_DATA   0x14  /* 20: SDRAM/HBM ECC */
++
++/* control_i bit fields (RERI v1.0 §2.4.1). */
++#define RERI_CONTROL_ELSE (1ULL << 0)   /* record + signal enable         */
++#define RERI_CONTROL_CECE (1ULL << 1)   /* corrected-error counter enable */
++#define RERI_CONTROL_CES_SHIFT  2       /* CE signal select               */
++#define RERI_CONTROL_UEDS_SHIFT 4       /* UED signal select              */
++#define RERI_CONTROL_UECS_SHIFT 6       /* UEC signal select              */
++#define RERI_CONTROL_SIGSEL_MASK 0x3ULL
++#define RERI_CONTROL_EID_SHIFT  32      /* error injection delay counter  */
++#define RERI_CONTROL_EID_MASK   (0xFFFFULL << RERI_CONTROL_EID_SHIFT)
++#define RERI_CONTROL_SINV (1ULL << 48)  /* status invalidate (atomic)     */
++#define RERI_CONTROL_SRDP (1ULL << 49)  /* set read-in-progress           */
++
++/* Signal select encodings for ces/ueds/uecs. */
++#define RERI_SIG_DISABLED 0
++#define RERI_SIG_LOW      1  /* low-priority RAS signal  */
++#define RERI_SIG_HIGH     2  /* high-priority RAS signal */
++#define RERI_SIG_PLATFORM 3  /* platform specific        */
++
++#define RERI_CONTROL_EID(n) (((uint64_t)(n) << RERI_CONTROL_EID_SHIFT) & \
++                             RERI_CONTROL_EID_MASK)
++#define RERI_CONTROL_UECS(sel) (((uint64_t)(sel) & RERI_CONTROL_SIGSEL_MASK) << \
++                                RERI_CONTROL_UECS_SHIFT)
++#define RERI_CONTROL_UEDS(sel) (((uint64_t)(sel) & RERI_CONTROL_SIGSEL_MASK) << \
++                                RERI_CONTROL_UEDS_SHIFT)
++#define RERI_CONTROL_CES(sel)  (((uint64_t)(sel) & RERI_CONTROL_SIGSEL_MASK) << \
++                                RERI_CONTROL_CES_SHIFT)
++
++#endif /* APP_RERI_REGS_H_ */
+diff --git a/samples/subsys/pmci/pldm/serial_bridge/src/reri_shell.c b/samples/subsys/pmci/pldm/serial_bridge/src/reri_shell.c
+new file mode 100644
+index 00000000000..370cbce8609
+--- /dev/null
++++ b/samples/subsys/pmci/pldm/serial_bridge/src/reri_shell.c
+@@ -0,0 +1,144 @@
++/*
++ * Copyright (c) 2026 OCP Hardware-Fault-Management project
++ *
++ * SPDX-License-Identifier: Apache-2.0
++ *
++ * RERI error-injection shell.
++ *
++ * Injects a synthetic error *record* into the RERI bank using the architected
++ * mechanism (RERI v1.0 §2.4.1): program the record while status_i.v == 0, then
++ * write control_i.eid with a non-zero delay count. The QEMU model's delay
++ * counter expires, sets status_i.v = 1, updates valid_summary, and raises the
++ * RERI RAS signal (wired to the PLIC), which the RAS handler (reri_ras.c)
++ * services. This injects a record to exercise the reporting path; it does not
++ * corrupt real memory.
++ *
++ * Commands:
++ *   reri sdram-ue  [<addr>]   inject an uncorrected system-memory (SDRAM ECC)
++ *                             error, high-priority signal
++ *   reri sdram-ce  [<addr>]   inject a corrected system-memory error,
++ *                             low-priority signal
++ *   reri dump                 show the bank header + record 0 registers
++ */
++
++#include <stdlib.h>
++
++#include <zephyr/kernel.h>
++#include <zephyr/shell/shell.h>
++#include <zephyr/sys/sys_io.h>
++#include <zephyr/devicetree.h>
++#include <zephyr/logging/log.h>
++
++#include "reri_regs.h"
++
++LOG_MODULE_REGISTER(reri_shell, LOG_LEVEL_INF);
++
++#define RERI_NODE DT_NODELABEL(reri0)
++#define RERI_BASE ((mem_addr_t)DT_REG_ADDR(RERI_NODE))
++
++static inline uint64_t reri_rd(uint32_t off)
++{
++	return sys_read64(RERI_BASE + off);
++}
++
++static inline void reri_wr(uint32_t off, uint64_t val)
++{
++	sys_write64(val, RERI_BASE + off);
++}
++
++/* Default injection address if the user gives none. */
++#define RERI_DEFAULT_ADDR 0x80000000ULL
++
++/*
++ * Program record 0 with a synthetic error, then arm the eid delay counter.
++ * The write to status_i takes effect only while v == 0, so we clear any stale
++ * valid record first via the sinv handshake.
++ */
++static void reri_inject(uint64_t status, uint64_t addr, uint64_t control)
++{
++	uint32_t base = RERI_RECORD_OFFSET(0);
++
++	/* Invalidate any previous record so status_i is writable. */
++	if (reri_rd(base + RERI_REC_STATUS) & RERI_STATUS_V) {
++		reri_wr(base + RERI_REC_CONTROL, RERI_CONTROL_SINV);
++	}
++
++	reri_wr(base + RERI_REC_STATUS, status);
++	reri_wr(base + RERI_REC_ADDR_INFO, addr);
++	reri_wr(base + RERI_REC_INFO, 0);
++	/* Arm injection last: eid > 0 starts the delay counter. */
++	reri_wr(base + RERI_REC_CONTROL, control | RERI_CONTROL_EID(1));
++}
++
++static uint64_t parse_addr(size_t argc, char **argv, size_t idx)
++{
++	if (argc > idx) {
++		return strtoull(argv[idx], NULL, 0);
++	}
++	return RERI_DEFAULT_ADDR;
++}
++
++static int cmd_sdram_ue(const struct shell *sh, size_t argc, char **argv)
++{
++	uint64_t addr = parse_addr(argc, argv, 1);
++	uint64_t status = ((uint64_t)RERI_EC_SYSTEM_MEMORY_DATA << RERI_STATUS_EC_SHIFT) |
++			  RERI_STATUS_UEC |
++			  ((uint64_t)RERI_PRI_HIGH << RERI_STATUS_PRI_SHIFT) |
++			  ((uint64_t)RERI_AIT_SPA << RERI_STATUS_AIT_SHIFT);
++	uint64_t control = RERI_CONTROL_ELSE | RERI_CONTROL_UECS(RERI_SIG_HIGH);
++
++	reri_inject(status, addr, control);
++	shell_print(sh, "injected SDRAM uncorrected error @ 0x%llx (ec=0x%02x, high-pri)",
++		    (unsigned long long)addr, RERI_EC_SYSTEM_MEMORY_DATA);
++	return 0;
++}
++
++static int cmd_sdram_ce(const struct shell *sh, size_t argc, char **argv)
++{
++	uint64_t addr = parse_addr(argc, argv, 1);
++	uint64_t status = ((uint64_t)RERI_EC_SYSTEM_MEMORY_DATA << RERI_STATUS_EC_SHIFT) |
++			  RERI_STATUS_CE |
++			  ((uint64_t)RERI_PRI_LOW << RERI_STATUS_PRI_SHIFT) |
++			  ((uint64_t)RERI_AIT_SPA << RERI_STATUS_AIT_SHIFT);
++	uint64_t control = RERI_CONTROL_ELSE | RERI_CONTROL_CES(RERI_SIG_LOW);
++
++	reri_inject(status, addr, control);
++	shell_print(sh, "injected SDRAM corrected error @ 0x%llx (ec=0x%02x, low-pri)",
++		    (unsigned long long)addr, RERI_EC_SYSTEM_MEMORY_DATA);
++	return 0;
++}
++
++static int cmd_dump(const struct shell *sh, size_t argc, char **argv)
++{
++	uint32_t base = RERI_RECORD_OFFSET(0);
++
++	ARG_UNUSED(argc);
++	ARG_UNUSED(argv);
++
++	shell_print(sh, "RERI bank @ 0x%lx", (unsigned long)RERI_BASE);
++	shell_print(sh, "  vendor_n_imp_id = 0x%016llx",
++		    (unsigned long long)reri_rd(RERI_REG_VENDOR_N_IMP_ID));
++	shell_print(sh, "  bank_info       = 0x%016llx",
++		    (unsigned long long)reri_rd(RERI_REG_BANK_INFO));
++	shell_print(sh, "  valid_summary   = 0x%016llx",
++		    (unsigned long long)reri_rd(RERI_REG_VALID_SUMMARY));
++	shell_print(sh, "  record 0:");
++	shell_print(sh, "    control   = 0x%016llx",
++		    (unsigned long long)reri_rd(base + RERI_REC_CONTROL));
++	shell_print(sh, "    status    = 0x%016llx",
++		    (unsigned long long)reri_rd(base + RERI_REC_STATUS));
++	shell_print(sh, "    addr_info = 0x%016llx",
++		    (unsigned long long)reri_rd(base + RERI_REC_ADDR_INFO));
++	return 0;
++}
++
++SHELL_STATIC_SUBCMD_SET_CREATE(reri_cmds,
++	SHELL_CMD_ARG(sdram-ue, NULL,
++		      "Inject uncorrected SDRAM error [<addr>]", cmd_sdram_ue, 1, 1),
++	SHELL_CMD_ARG(sdram-ce, NULL,
++		      "Inject corrected SDRAM error [<addr>]", cmd_sdram_ce, 1, 1),
++	SHELL_CMD_ARG(dump, NULL,
++		      "Dump the RERI bank header and record 0", cmd_dump, 1, 0),
++	SHELL_SUBCMD_SET_END);
++
++SHELL_CMD_REGISTER(reri, &reri_cmds, "RISC-V RERI error injection", NULL);
